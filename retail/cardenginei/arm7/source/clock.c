@@ -26,6 +26,8 @@
 
 #include <nds/arm7/clock.h>
 #include <nds/ndstypes.h>
+#include "ra_bridge.h"
+#include "ra.h"
 
 
 
@@ -109,6 +111,67 @@ void rtcTransaction(uint8 * command, uint32 commandLength, uint8 * result, uint3
 	// Finish up by dropping CS low
 	RTC_CR8 = CS_0 | SCK_1;
 	swiDelay(RTC_DELAY);
+}
+
+/* RA notification carrier. Altered libnds clock module: bounded, polled RTC
+ * register transactions, no IRQ_NETWORK ownership and no handshake spin loop.
+ * Called with IRQs excluded by the existing VBlank handler. CS high means an
+ * interrupted game RTC transaction owns the bus; defer without touching it. */
+static __attribute__((optimize("Os"))) u8 raRtcRegister(u8 command,u8 data,int read) {
+	u8 value=0;
+	RTC_CR8=CS_0|SCK_1|SIO_1;
+	swiDelay(4);
+	RTC_CR8=CS_1|SCK_1|SIO_1;
+	swiDelay(4);
+	for(unsigned bit=0;bit<8;bit++) {
+		RTC_CR8=CS_1|SCK_0|SIO_out|(command>>7);
+		swiDelay(4);
+		RTC_CR8=CS_1|SCK_1|SIO_out|(command>>7);
+		swiDelay(4);command<<=1;
+	}
+	/* RTCom registers 112/113 shift DATA MSB first as well as the command.
+	 * Ordinary libnds date/time parameters use the opposite order. */
+	for(unsigned bit=0;bit<8;bit++) {
+		RTC_CR8=read?(CS_1|SCK_0):(CS_1|SCK_0|SIO_out|(data>>7));
+		swiDelay(4);
+		RTC_CR8=read?(CS_1|SCK_1):(CS_1|SCK_1|SIO_out|(data>>7));
+		swiDelay(4);
+		if(read)value=(value<<1)|((RTC_CR8&SIO_in)!=0);
+		data<<=1;
+	}
+	swiDelay(4);
+	RTC_CR8=CS_0|SCK_1;
+	return value;
+}
+void __attribute__((optimize("Os"))) raBridgeArm7(volatile u32 *shared) {
+	static u32 pending;
+	u32 request=shared[RA_BRIDGE_SHARED_SLOT];
+	if((request&RA_BRIDGE_TAG_MASK)!=RA_BRIDGE_REQUEST){pending=0;return;}
+	if(((request>>8)&255)<RA_RTC_HELLO || ((request>>8)&255)>RA_RTC_STATS)return;
+	if(raCardReadPending(shared[3]))return;
+	if(RTC_CR8&(1<<2))return;
+	u8 saved=RTC_CR8;
+	u8 status=raRtcRegister(0x6f,0,1);
+	u8 command=(u8)(request>>8);
+	if(pending!=request) {
+		/* HELLO never steals registers from an existing RTCom client. */
+		if(command==RA_RTC_HELLO && status!=0 && status!=RA_RTC_HELLO_ACK &&
+		   status!=RA_RTC_COMMIT_ACK && status!=RA_RTC_BAD && status!=RA_RTC_BUSY &&
+		   status!=RA_RTC_STATS_ACK &&
+		   status!=RA_RTC_PING_ACK &&
+		   status!=RA_RTC_BYTE0_ACK && status!=RA_RTC_BYTE1_ACK && status!=RA_RTC_START_ACK) {
+			shared[RA_BRIDGE_SHARED_SLOT]=RA_BRIDGE_RESPONSE|((u32)RA_RTC_BAD<<8);
+		} else {
+			raRtcRegister(0x6c,(u8)request,0);
+			raRtcRegister(0x6e,command,0);
+			pending=request;
+		}
+	} else if(status>=RA_RTC_HELLO_ACK) {
+		u8 data=(command==RA_RTC_PING || command==RA_RTC_STATS)?raRtcRegister(0x6d,0,1):(u8)request;
+		shared[RA_BRIDGE_SHARED_SLOT]=RA_BRIDGE_RESPONSE|((u32)status<<8)|data;
+		pending=0;
+	}
+	RTC_CR8=saved;
 }
 
 

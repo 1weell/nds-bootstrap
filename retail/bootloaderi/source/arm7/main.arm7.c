@@ -117,6 +117,7 @@ extern u32 cheatSize;
 extern u32 patchOffsetCacheFileCluster;
 extern u32 ramDumpCluster;
 extern u32 srParamsFileCluster;
+extern u32 raUnlocksCluster;   /* step 3b; 0 when the launcher found no queue file */
 extern u32 screenshotCluster;
 extern u32 apFixOverlaysCluster;
 extern u32 pageFileCluster;
@@ -187,6 +188,29 @@ bool ndmaDisabled = false;
 bool sharedWramEnabled = false;
 bool colorLutEnabled = false;
 bool colorLutBlockVCount = false;
+bool raWramLoaded = false;
+
+/*
+    How much of DSi WRAM is left for the nitro file info preload and for the ROM-in-RAM
+    headroom, after whichever tenant took the top of the window.
+
+    The colour LUT and cardenginei_arm9_ra are mutually exclusive -- the LUT's stored
+    palettes sit inside the range the RA binary occupies -- so this is a choice of one,
+    not a sum. Three callers consult it and they were three copies of the same ternary
+    before; see the space budget in docs/retroachievements.md.
+
+    Deliberately does *not* check dsiWramAccess: the callers already have, and returning
+    0 here would make loadNitroFileInfoIntoRAM() skip its preload for the wrong reason.
+*/
+u32 dsiWramCacheSize(void) {
+	if (colorLutEnabled) {
+		return 0x32800;
+	}
+	if (raWramLoaded) {
+		return CARDENGINEI_ARM9_RA_WRAMSIZE;
+	}
+	return 0x80000;
+}
 
 u32 newArm7binarySize = 0;
 u32 newArm7ibinarySize = 0;
@@ -894,7 +918,7 @@ static bool isROMLoadableInRAM(const tDSiHeader* dsiHeader, const tNDSHeader* nd
 	) {
 		const bool twlType = (ROMsupportsDsiMode(ndsHeader) && dsiModeConfirmed);
 		const bool cheatsEnabled = (cheatSizeTotal > 4 && cheatSizeTotal <= 0x8000);
-		u32 wramSize = (dsiWramAccess && !dsiWramMirrored) ? (colorLutEnabled ? 0x32800 : 0x80000) : 0;
+		u32 wramSize = (dsiWramAccess && !dsiWramMirrored) ? dsiWramCacheSize() : 0;
 		if (ce7Location == CARDENGINEI_ARM7_LOCATION) {
 			wramSize += 0x8000; // Shared 32KB of WRAM is available for ARM9 to use
 			sharedWramEnabled = true;
@@ -1288,7 +1312,7 @@ static void loadNitroFileInfoIntoRAM(const tNDSHeader* ndsHeader, aFile* romFile
 	if (baseFatSize == 0) return;
 
 	const u32 size = (baseFatOff-baseFntOff)+baseFatSize;
-	if (size > (colorLutEnabled ? 0x32800 : 0x80000)) return;
+	if (size > dsiWramCacheSize()) return;
 
 	sdmmc_set_ndma_slot(0);
 	fileRead((char*)0x03700000, romFile, baseFntOff, size);
@@ -2098,6 +2122,7 @@ int arm7_main(void) {
 			romFile->firstCluster,
 			patchOffsetCacheFileCluster,
 			srParamsFileCluster,
+			raUnlocksCluster,
 			ramDumpCluster,
 			screenshotCluster,
 			wideCheatFileCluster,
@@ -2320,6 +2345,131 @@ int arm7_main(void) {
 			}
 		}
 
+		/*
+		    Copy cardenginei_arm9_ra into DSi WRAM, mirroring the colour LUT above --
+		    including handing WRAM to the ARM7 only in DSi mode, which is what the LUT
+		    does and therefore what is known to work.
+
+		    !colorLutEnabled because the two share the window; the launcher already
+		    refuses to stage this when the filter is on, and this is the second half of
+		    the same rule. Placed here so raWramLoaded is set before
+		    isROMLoadableInRAM() consults dsiWramCacheSize() further down.
+
+		    The verification compares the first word rather than trusting the copy, the
+		    same way colorLutEnabled is decided. The cardengine checks again that the
+		    window begins with a branch before it ever calls into it.
+		*/
+		if ((dsiWramAccess && !dsiWramMirrored) && !colorLutEnabled
+		 && *(u32*)CARDENGINEI_ARM9_RA_BUFFERED_LOCATION == CARDENGINEI_ARM9_RA_STAGE_MAGIC) {
+			const u32* raSrc = (u32*)(CARDENGINEI_ARM9_RA_BUFFERED_LOCATION + CARDENGINEI_ARM9_RA_IMAGE_OFFSET);
+			dbg_printf("RetroAchievements WRAM binary\n");
+
+			if (ROMsupportsDsiMode(ndsHeader) && dsiModeConfirmed) {
+				arm9_stateFlag = ARM9_WRAMONARM7;
+				while (arm9_stateFlag != ARM9_READY);
+			}
+
+			tonccpy((u32*)CARDENGINEI_ARM9_RA_LOCATION, raSrc, CARDENGINEI_ARM9_RA_IMAGE_MAX);
+			raWramLoaded = (*(u32*)CARDENGINEI_ARM9_RA_LOCATION == *raSrc);
+
+			/*
+			    Achievement definitions, if the launcher staged any. A separate copy rather
+			    than part of the image, because the block lives at the top of the window
+			    while the image sits at the bottom -- and the heap between them is shortened
+			    to stop below it, so this is the one region the allocator will not reclaim.
+
+			    Its own magic, checked separately: definitions are optional and a missing
+			    file must leave the binary working on its built-in self-test rather than
+			    reading whatever the window happened to contain.
+			*/
+			if (*(u32*)CARDENGINEI_ARM9_RA_DEFS_BUFFERED_LOCATION == CARDENGINEI_ARM9_RA_DEFS_MAGIC) {
+				tonccpy((u32*)CARDENGINEI_ARM9_RA_DEFS_LOCATION,
+				        (u32*)CARDENGINEI_ARM9_RA_DEFS_BUFFERED_LOCATION,
+				        CARDENGINEI_ARM9_RA_DEFS_MAX);
+			} else {
+				*(u32*)CARDENGINEI_ARM9_RA_DEFS_LOCATION = 0;
+			}
+
+			/*
+			    And the pending-unlock tally, on the same terms: its own magic, checked
+			    separately, because a boot that staged no queue must leave the menu showing
+			    nothing rather than reading whatever the window happened to contain.
+			*/
+			if (*(u32*)CARDENGINEI_ARM9_RA_PENDING_BUFFERED_LOCATION == CARDENGINEI_ARM9_RA_PENDING_MAGIC) {
+				tonccpy((u32*)CARDENGINEI_ARM9_RA_PENDING_LOCATION,
+				        (u32*)CARDENGINEI_ARM9_RA_PENDING_BUFFERED_LOCATION,
+				        CARDENGINEI_ARM9_RA_PENDING_MAX);
+			} else {
+				*(u32*)CARDENGINEI_ARM9_RA_PENDING_LOCATION = 0;
+			}
+
+			/*
+			    And what kind of session this is, on the same terms again: its own
+			    magic, checked separately, and the destination's first word zeroed when
+			    there is nothing to copy. That zero is what the in-game menu reads as
+			    "nobody told me", which is the answer that leaves its RAM editor alone.
+			*/
+			if (*(u32*)CARDENGINEI_ARM9_RA_SESSION_BUFFERED_LOCATION == CARDENGINEI_ARM9_RA_SESSION_MAGIC) {
+				tonccpy((u32*)CARDENGINEI_ARM9_RA_SESSION_LOCATION,
+				        (u32*)CARDENGINEI_ARM9_RA_SESSION_BUFFERED_LOCATION,
+				        CARDENGINEI_ARM9_RA_SESSION_MAX);
+
+				/*
+				    And the last word on cheats, taken here because here is where it is
+				    finally true.
+
+				    The launcher decides the session's mode from the three cheat files it
+				    can size, and that is the best it can do -- it cannot know whether the
+				    total will *fit*. The room depends on the ROM's own layout and is
+				    worked out a few hundred lines above this, differently again in
+				    hook_arm7.c, and `cheatSizeTotal` has already been zeroed once up there
+				    for a console with no space to put an engine in.
+
+				    So by this line the answer is settled, and it is a byte away from the
+				    block that carries it into the game. The floor is the same one the
+				    launcher used; the ceiling belongs to `cheatsEnabled` below and only
+				    ever refuses more.
+
+				    Written as an offset rather than through the structure, like every
+				    other reach into these blocks from this file: the bootloader acts on
+				    them without knowing what they are, and the host suite is what holds
+				    the offset to the struct.
+
+				    Downgrade only. A boot may lose hardcore here and can never gain it:
+				    the launcher has already signed r=startsession with what it believed,
+				    and a block that granted more than the launcher claimed would be this
+				    fork lying to itself before it lied to the server.
+				*/
+				if (cheatSizeTotal > CARDENGINEI_ARM9_RA_CHEATS_MIN_BYTES) {
+					/*
+					    The reason goes in beside the flag, and only when there was
+					    something to take away. Setting it on a session that never
+					    asked for hardcore would have the menu explaining a refusal
+					    that never happened.
+					*/
+					if (*(u8*)(CARDENGINEI_ARM9_RA_SESSION_LOCATION
+					           + CARDENGINEI_ARM9_RA_SESSION_HARDCORE_OFFSET)) {
+						*(u8*)(CARDENGINEI_ARM9_RA_SESSION_LOCATION
+						       + CARDENGINEI_ARM9_RA_SESSION_REFUSAL_OFFSET) =
+							CARDENGINEI_ARM9_RA_SESSION_REFUSED_CHEATS;
+					}
+					*(u8*)(CARDENGINEI_ARM9_RA_SESSION_LOCATION
+					       + CARDENGINEI_ARM9_RA_SESSION_HARDCORE_OFFSET) = 0;
+				}
+			} else {
+				*(u32*)CARDENGINEI_ARM9_RA_SESSION_LOCATION = 0;
+			}
+
+			if (ROMsupportsDsiMode(ndsHeader) && dsiModeConfirmed) {
+				arm9_stateFlag = ARM9_WRAMONARM9;
+				while (arm9_stateFlag != ARM9_READY);
+			}
+		}
+		*(u32*)CARDENGINEI_ARM9_RA_BUFFERED_LOCATION = 0;
+		*(u32*)CARDENGINEI_ARM9_RA_DEFS_BUFFERED_LOCATION = 0;
+		*(u32*)CARDENGINEI_ARM9_RA_PENDING_BUFFERED_LOCATION = 0;
+		*(u32*)CARDENGINEI_ARM9_RA_SESSION_BUFFERED_LOCATION = 0;
+
 		toncset((u32*)CARDENGINEI_ARM9_CLUT_BUFFERED_LOCATION, 0, 0x1800);
 		*(u32*)(COLOR_LUT_BUFFERED_LOCATION-4) = 0;
 		toncset((u16*)COLOR_LUT_BUFFERED_LOCATION, 0, 0x10000);
@@ -2386,6 +2536,7 @@ int arm7_main(void) {
 			romFile->firstCluster,
 			patchOffsetCacheFileCluster,
 			srParamsFileCluster,
+			raUnlocksCluster,
 			ramDumpCluster,
 			screenshotCluster,
 			wideCheatFileCluster,

@@ -40,9 +40,13 @@ CFLAGS	:=	-g -Wall -O2\
 
 # ADD -DDEBUG here for logging/debug
 CFLAGS	+=	$(INCLUDE) -DARM9 -DNO_CARDID
+
 CXXFLAGS	:=	$(CFLAGS) -fno-rtti -fno-exceptions
 
 ASFLAGS	:=	-g $(ARCH) $(INCLUDE)
+# The RA reader's per-frame hook lives in card_engine_header.s, which never sees
+# RA_READER_ENABLED. Set wherever that is on; a mismatch fails the link, not the build.
+ASFLAGS	+=	-DRA_VBLANK_HOOK
 
 LDFLAGS	=	-nostartfiles -T cardengine.ld -g $(ARCH) -Wl,-Map,$(notdir $*.map)
 

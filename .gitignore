@@ -138,3 +138,29 @@ retail/arm9/include/version.h
 !retail/nitrofiles/bootloader_images.lz77
 !retail/nitrofiles/dstwo.dldi
 !retail/nitrofiles/esrbOnlineNotice.lz77
+
+# Built by tools/ra_release.sh. The deliverable, and deliberately not in the tree: it is two
+# megabytes that change on every build, and the script prints its md5 and the commit it came from
+# so a ROM can be tied back to a revision without the ROM being stored beside it.
+nds-bootstrap-release.nds
+
+# Built by tools/wifiprobe (a diagnostic, not a deliverable)
+tools/wifiprobe/wifiprobe.nds
+tools/wifiprobe/arm7/build/
+tools/wifiprobe/arm9/build/
+tools/wifiprobe/arm7/wifiprobe.elf
+tools/wifiprobe/arm9/wifiprobe.elf
+
+# Private console material
+*.cxi
+*.firm
+*.nds
+*.sav
+*.dmp
+ra.cfg
+installation*.json
+__pycache__/
+
+*.log
+!docs/logs/ra_wifi_launcher-3ds.log
+!docs/logs/ra_wifi_launcher_http-3ds.log

@@ -7,11 +7,13 @@ $(error "Please set DEVKITARM in your environment. export DEVKITARM=<path to>dev
 endif
 
 include $(DEVKITARM)/ds_rules
+CPP := $(PREFIX)cpp
 
 ifeq ($(OS),Windows_NT)
 LZSS			?=	../../../../lzss.exe
 
 else
+
 
 LZSS			?=	lzss
 
@@ -125,6 +127,10 @@ DEPENDS	:=	$(OFILES:.o=.d)
 $(OUTPUT_CMP).lz77: $(OUTPUT).bin
 	@cp $< $@
 	@$(LZSS) -ewf $@
+
+# RTC bridge must fit inside the existing WRAM/stack reservation. Keep the
+# low-level SD driver at its original optimization; shrink only these modules.
+cardengine.o clock.o inGameMenu.o: CFLAGS += -Os
 
 $(OUTPUT).bin:	$(DEPSDIR)/$(TARGET).elf
 $(DEPSDIR)/$(TARGET).elf:	cardengine.ld $(OFILES)

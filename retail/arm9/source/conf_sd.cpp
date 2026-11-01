@@ -1,6 +1,8 @@
+#include "ra_queue_file.h"
 #include <stdlib.h> // strtol
 #include <errno.h>
 #include <unistd.h>
+#include <sys/stat.h>
 //#include <stdio.h>
 #include <nds.h>
 #include <nds/arm9/dldi.h>
@@ -31,6 +33,8 @@
 #include "nitrofs.h"
 #include "igm_text.h"
 #include "locations.h"
+/* Step 3b: RA_QUEUE_PATH and RA_QUEUE_BYTES, which are defined whether or not the WiFi switch is on. */
+#include "ra_wifi.h"
 #include "version.h"
 
 #include "nandio.h"
@@ -73,6 +77,7 @@ extern std::string wideCheatFilePath;
 extern std::string cheatFilePath;
 extern std::string ramDumpPath;
 extern std::string srParamsFilePath;
+extern std::string raUnlocksFilePath;   /* step 3b, set below */
 extern std::string screenshotPath;
 extern std::string apFixOverlaysPath;
 extern std::string musicsFilePath;
@@ -185,6 +190,75 @@ extern void loadApFix(configuration* conf, const char* bootstrapPath, const char
 // extern void loadApFixPostCardRead(configuration* conf, const char* bootstrapPath, const char* romTid, const u16 headerCRC);
 extern void loadMobiclipOffsets(configuration* conf, const char* bootstrapPath, const char* romTid, const u8 romVersion, const u16 headerCRC);
 extern void loadDSi2DSSavePatch(configuration* conf, const char* bootstrapPath, const char* romTid, const u8 romVersion, const u16 headerCRC);
+
+/*
+    Where the user puts a definition to try. Alongside TWLFontTable.dat and the rest of this
+    fork's data, so it is where anyone would look for it.
+*/
+#define RA_DEFINITIONS_PATH "sd:/_nds/nds-bootstrap/ra_achievements.txt"
+
+/*
+    Stage the achievement definitions, if the user has put a file there.
+
+    Deliberately not loadCardEngineBinary(): that reads the whole file into the destination
+    without bounding it, which is fine for a binary this project builds and ships and is not
+    fine for a text file a user edits by hand. A definition file is the one input here that
+    does not come from us, so its length is checked against the space before a byte is read.
+
+    Absent, empty or oversized are all the same non-event -- the magic simply is not written
+    and the WRAM binary falls back to its built-in self-test. Nothing about a missing file
+    should stop a game from booting.
+*/
+/*
+    Not static, because step 4's mode 2 has to be able to put it back.
+
+    The launcher stages this file, and then -- if `RA_LAUNCHER_WIFI=2` -- `r=patch` streams the
+    server's own set into the *same block*, destroying the file's text as it goes. That is the
+    design and not an accident: the reply is three times the block, so there is nowhere else for it
+    to be scanned into. Which means a fetch that fails partway leaves the user with neither the
+    server's set nor their own file, and the fix is to re-stage rather than to preserve. See
+    raWifiFetchPatch().
+*/
+extern "C" void loadRaDefinitions(void) {
+	FILE* file = fopen(RA_DEFINITIONS_PATH, "rb");
+	long  size;
+
+	if (!file) {
+		return;
+	}
+	fseek(file, 0, SEEK_END);
+	size = ftell(file);
+	fseek(file, 0, SEEK_SET);
+
+	/*
+	    Room for the header and a terminator, or it does not go -- and room for the three structures
+	    that live in the top of this same reservation, which this check used to ignore.
+
+	    raWifiFetchPatch() has subtracted them for a while, because a fetched set arrives from a
+	    scanner that fills whatever it is given. A hand-written file is bounded by whoever wrote it
+	    and so looked safe, but the bound is the same bound: at 30 KB this file would have written
+	    straight through the pending tally, the viewer's index and the session block that decides
+	    whether the in-game menu may edit RAM. Two of those are cosmetic if they are wrong. The third
+	    is not, and a file large enough to reach it would silently unlock the RAM editor in a
+	    hardcore session.
+	*/
+	if (size > 0
+	 && size < (long)(CARDENGINEI_ARM9_RA_DEFS_MAX
+	                  - CARDENGINEI_ARM9_RA_PENDING_MAX
+	                  - CARDENGINEI_ARM9_RA_VIEWER_MAX
+	                  - CARDENGINEI_ARM9_RA_SESSION_MAX
+	                  - CARDENGINEI_ARM9_RA_DEFS_HEADER - 1)) {
+		u8* text = (u8*)(CARDENGINEI_ARM9_RA_DEFS_BUFFERED_LOCATION
+		                 + CARDENGINEI_ARM9_RA_DEFS_HEADER);
+		if (fread(text, 1, size, file) == (size_t)size) {
+			text[size] = 0;
+			*(u32*)(CARDENGINEI_ARM9_RA_DEFS_BUFFERED_LOCATION + 4) = (u32)size;
+			/* Magic last, so a partial write is never mistaken for a complete one. */
+			*(u32*)CARDENGINEI_ARM9_RA_DEFS_BUFFERED_LOCATION = CARDENGINEI_ARM9_RA_DEFS_MAGIC;
+		}
+	}
+	fclose(file);
+}
 
 static int loadCardEngineBinary(const char* cardenginePath, u8* location) {
 	FILE* cebin = fopen(cardenginePath, "rb");
@@ -670,6 +744,13 @@ void getIgmStrings(configuration* conf, bool b4ds) {
 	// setIgmString(lang.fetch("MENU", "CHEATS", "Cheats...").c_str(), igmText->menu[6]);
 	setIgmString(lang.fetch("MENU", "RAM_VIEWER", "RAM Viewer...").c_str(), igmText->menu[6]);
 	setIgmString(lang.fetch("MENU", "QUIT_GAME", "Quit Game").c_str(), igmText->menu[7]);
+	/*
+	    A folder rather than a page, so the things RetroAchievements will want next -- forcing a sync,
+	    reading the launcher's log, showing the session -- have somewhere to go that is not the root.
+	*/
+	setIgmString(lang.fetch("MENU", "RETROACHIEVEMENTS", "Achievements...").c_str(), igmText->menu[8]);
+	setIgmString(lang.fetch("MENU", "RA_SYNC_PENDING", "Sync Pending").c_str(), igmText->raMenu[0]);
+	setIgmString(lang.fetch("MENU", "RA_ACHIEVEMENTS", "Achievements").c_str(), igmText->raMenu[1]);
 
 	setIgmString(lang.fetch("OPTIONS", "MAIN_SCREEN", "Main Screen").c_str(), igmText->optionsLabels[0]);
 	setIgmString(lang.fetch("OPTIONS", "BRIGHTNESS", "Brightness").c_str(), igmText->optionsLabels[1]);
@@ -1761,6 +1842,48 @@ int loadFromSD(configuration* conf, const char *bootstrapPath) {
 			}
 		}
 
+		/*
+		    Stage cardenginei_arm9_ra for the bootloader to copy into DSi WRAM. Only on
+		    the 3DS family, which is the only hardware this fork supports for
+		    RetroAchievements, and only when the colour filter is off: the two compete for
+		    the same WRAM, since the LUT's stored palettes live inside the window the RA
+		    binary takes. An explicit user choice of colour filters wins over a feature
+		    nobody asked for yet.
+
+		    The magic goes in only after a successful read, and is cleared first, because
+		    the staging region is uninitialised and the bootloader trusts that word.
+
+		    All three magics, and the pending one was missing here. The bootloader checks it
+		    exactly as it checks the other two -- see main.arm7.c -- and the only thing that
+		    had ever cleared it was the *previous* boot's bootloader, on its way out. So the
+		    launcher's guarantee was not self-contained: it held only for a boot that followed
+		    one which had got that far. On the first boot after power-on the word is whatever
+		    RAM came up holding, and on any boot where the wifi ladder stops before stage 13 --
+		    no access point, no config, a refused login, all ordinary -- raWifiStagePending()
+		    never writes, and that stale word is what decides whether the in-game menu shows a
+		    pending list and whose.
+
+		    Four words now, and the fourth is the one where a stale value is not merely
+		    cosmetic. The session block tells the in-game menu whether this boot is hardcore,
+		    and the menu locks its RAM editor when it is. Left uncleared, the word RAM came up
+		    holding decides that -- in either direction. A stale "hardcore" would refuse a
+		    player their hex editor for no reason they can see, and a stale magic over a boot
+		    that never staged one would hand the editor to a hardcore session.
+
+		    Cleared in one place, rather than three here and one by somebody else's exit path.
+		*/
+		*(u32*)CARDENGINEI_ARM9_RA_BUFFERED_LOCATION = 0;
+		*(u32*)CARDENGINEI_ARM9_RA_DEFS_BUFFERED_LOCATION = 0;
+		*(u32*)CARDENGINEI_ARM9_RA_PENDING_BUFFERED_LOCATION = 0;
+		*(u32*)CARDENGINEI_ARM9_RA_SESSION_BUFFERED_LOCATION = 0;
+		if (!colorTable && conf->consoleModel > 0) {
+			if (loadCardEngineBinary("nitro:/cardenginei_arm9_ra.bin",
+					(u8*)(CARDENGINEI_ARM9_RA_BUFFERED_LOCATION + CARDENGINEI_ARM9_RA_IMAGE_OFFSET)) == 0) {
+				*(u32*)CARDENGINEI_ARM9_RA_BUFFERED_LOCATION = CARDENGINEI_ARM9_RA_STAGE_MAGIC;
+				loadRaDefinitions();
+			}
+		}
+
 		if (colorTable) {
 			loadCardEngineBinary("nitro:/cardenginei_arm9_colorlut.bin", (u8*)CARDENGINEI_ARM9_CLUT_BUFFERED_LOCATION);
 
@@ -2647,6 +2770,32 @@ int loadFromSD(configuration* conf, const char *bootstrapPath) {
 		fseek(srParamsFile, 0x50 - 1, SEEK_SET);
 		fputc('\0', srParamsFile);
 		fclose(srParamsFile);
+	}
+
+	/*
+	    Step 3b: the unlock queue, created here for the same reason softResetParams.bin is -- the
+	    cardengine can write into clusters that already exist and cannot allocate any, so the file has
+	    to be full length before the game boots. Zero filled; every record is empty.
+
+	    Created unconditionally, not under the WiFi switch. The two halves are independent: the
+	    cardengine can record an unlock on a build with no networking at all, and the queue simply
+	    waits for a boot that has some. Gating this on RA_LAUNCHER_WIFI would silently make earned
+	    achievements unrecordable on exactly the builds most people run.
+
+	    Only create a missing file. An existing file of any size may contain unsent unlocks; the
+	    network ladder handles migration. If it cannot, the cluster handoff rejects a short file.
+	*/
+	raUnlocksFilePath = conf->gameOnFlashcard ? RA_QUEUE_PATH_FAT : RA_QUEUE_PATH;
+	struct stat queueStat;
+	if (raQueueFileRecover(raUnlocksFilePath.c_str()) &&
+	    stat(raUnlocksFilePath.c_str(), &queueStat) != 0 && errno == ENOENT) {
+		FILE* queueFile = fopen(raUnlocksFilePath.c_str(), "wb");
+
+		if (queueFile) {
+			fseek(queueFile, RA_QUEUE_BYTES - 1, SEEK_SET);
+			fputc('\0', queueFile);
+			fclose(queueFile);
+		}
 	}
 
 	conf->donorFileOffset = 0;

@@ -81,6 +81,7 @@ u32 fileRead(char* buffer, aFile* file, u32 startOffset, u32 length);
 bool fileReadNonBLocking(char* buffer, aFile* file, u32 startOffset, u32 length);
 bool resumeFileRead();
 u32 fileWrite(const char* buffer, aFile* file, u32 startOffset, u32 length);
+
 #ifdef TWOCARD
 u32 FAT_ClustToSect(u32 cluster, const bool boolCard2);
 #else

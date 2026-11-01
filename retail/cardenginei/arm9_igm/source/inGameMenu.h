@@ -11,8 +11,15 @@ typedef enum {
 	MENU_RAM_DUMP = 4,
 	MENU_OPTIONS = 5,
 	MENU_RAM_VIEWER = 6,
-	MENU_QUIT = 7
+	MENU_QUIT = 7,
+	MENU_RETROACHIEVEMENTS = 8
 } MenuItem;
+
+/* Inside that folder. One entry today; the folder exists so the next one costs nothing. */
+typedef enum {
+	RA_MENU_SYNC_PENDING = 0,
+	RA_MENU_ACHIEVEMENTS = 1
+} RaMenuItem;
 
 typedef enum {
 	OPTIONS_MAIN_SCREEN,

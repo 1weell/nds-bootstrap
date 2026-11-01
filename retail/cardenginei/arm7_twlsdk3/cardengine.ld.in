@@ -158,6 +158,7 @@ SECTIONS
 
 	__bss_end = . ;
 	__bss_end__ = . ;
+	ASSERT(__bss_end <= __sp_usr - 0x100, "ARM7 TWLSDK3 image overlaps reserved user stack")
 
 	_end = . ;
 	__end__ = . ;

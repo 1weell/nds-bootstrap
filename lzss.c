@@ -122,7 +122,7 @@ void Title(void) {
     "LZSS - (c) CUE 2011\n"
     "LZSS coding for Nintendo GBA/DS\n"
     "\n"
-  ); 
+  );
 }
 
 /*----------------------------------------------------------------------------*/
@@ -363,7 +363,7 @@ unsigned char *LZS_Code(unsigned char *raw_buffer, int raw_len, unsigned int *ne
 unsigned char *LZS_Fast(unsigned char *raw_buffer, int raw_len, unsigned int *new_len) {
   unsigned char *pak_buffer, *pak, *raw, *raw_end, *flg;
   unsigned int   pak_len, len, r, s, len_tmp, i;
-  unsigned char  mask; 
+  unsigned char  mask;
 
   pak_len = 4 + raw_len + ((raw_len + 7) / 8);
   pak_buffer = (unsigned char *) Memory(pak_len, sizeof(char));
@@ -487,7 +487,7 @@ void LZS_InsertNode(int r) {
 /*----------------------------------------------------------------------------*/
 void LZS_DeleteNode(int p) {
   int q;
-  
+
   if (dad[p] == LZS_NIL) return;
 
   if (rson[p] == LZS_NIL) {

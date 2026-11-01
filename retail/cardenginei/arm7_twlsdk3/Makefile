@@ -7,6 +7,7 @@ $(error "Please set DEVKITARM in your environment. export DEVKITARM=<path to>dev
 endif
 
 include $(DEVKITARM)/ds_rules
+CPP := $(PREFIX)cpp
 
 ifeq ($(OS),Windows_NT)
 LZSS			?=	../../../../lzss.exe
@@ -125,6 +126,9 @@ DEPENDS	:=	$(OFILES:.o=.d)
 $(OUTPUT_CMP).lz77: $(OUTPUT).bin
 	@cp $< $@
 	@$(LZSS) -ewf $@
+
+# Keep the RTC/menu service inside the existing WRAM and stack reservation.
+cardengine.o clock.o inGameMenu.o: CFLAGS += -Os
 
 $(OUTPUT).bin:	$(DEPSDIR)/$(TARGET).elf
 $(DEPSDIR)/$(TARGET).elf:	cardengine.ld $(OFILES)

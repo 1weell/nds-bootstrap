@@ -1,3 +1,4 @@
+#include "ra_queue_file.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string>
@@ -18,6 +19,7 @@
 #include "configuration.h"
 #include "nds_loader_arm9.h"
 #include "conf_sd.h"
+#include "ra_wifi.h"
 #include "version.h"
 
 #define REG_SCFG_EXT7 *(u32*)0x02FFFDF0
@@ -29,6 +31,9 @@ std::string wideCheatFilePath;
 std::string cheatFilePath;
 std::string ramDumpPath;
 std::string srParamsFilePath;
+/* Step 3b: the unlock queue the cardengine appends to. Set in conf_sd.cpp. */
+/* Step 3b: the unlock queue the cardengine appends to. Set in conf_sd.cpp. */
+std::string raUnlocksFilePath;
 std::string screenshotPath;
 std::string apFixOverlaysPath;
 std::string musicsFilePath;
@@ -464,6 +469,7 @@ static int runNdsFile(configuration* conf) {
 	u32 clusterPatchOffsetCache = 0;
 	u32 clusterRamDump = 0;
 	u32 clusterSrParams = 0;
+	u32 clusterRaUnlocks = 0;
 	u32 clusterScreenshot = 0;
 	u32 apFixOverlaysCluster = 0;
 	u32 musicCluster = 0;
@@ -533,6 +539,22 @@ static int runNdsFile(configuration* conf) {
 		clusterSrParams = stSrParams.st_ino;
 	}
 
+	/*
+	    Step 3b: the unlock queue. Left at zero when the file is not there, and the ARM7 reads zero as
+	    "no queue" -- so a card without one behaves exactly as it did before any of this existed.
+	*/
+	{
+		struct stat stRaUnlocks;
+
+		/* ARM7 cannot allocate clusters; never hand it a file of an unsafe size. */
+		if (raQueueFileReady(raUnlocksFilePath.c_str()) &&
+		    stat(raUnlocksFilePath.c_str(), &stRaUnlocks) >= 0 &&
+		    stRaUnlocks.st_size == RA_QUEUE_BYTES) {
+			clusterRaUnlocks = stRaUnlocks.st_ino;
+		}
+	}
+
+
 	if (stat(cheatFilePath.c_str(), &stCheat) >= 0) {
 		clusterCheat = stCheat.st_ino;
 	}
@@ -579,7 +601,7 @@ static int runNdsFile(configuration* conf) {
 		clusterTwlFont = stTwlFont.st_ino;
 	}
 
-	return runNds(st.st_ino, clusterSav, clusterDonor, /* clusterGba, clusterGbaSav, */ clusterQuit, clusterWideCheat, clusterApPatch, clusterApPatchPostCardRead, clusterDSi2DSSave, clusterCheat, clusterPatchOffsetCache, clusterRamDump, clusterSrParams, clusterScreenshot, apFixOverlaysCluster, musicCluster, clusterPageFile, clusterManual, clusterTwlFont, conf);
+	return runNds(st.st_ino, clusterSav, clusterDonor, /* clusterGba, clusterGbaSav, */ clusterQuit, clusterWideCheat, clusterApPatch, clusterApPatchPostCardRead, clusterDSi2DSSave, clusterCheat, clusterPatchOffsetCache, clusterRamDump, clusterSrParams, clusterScreenshot, apFixOverlaysCluster, musicCluster, clusterPageFile, clusterManual, clusterTwlFont, clusterRaUnlocks, conf);
 }
 
 int main(int argc, char** argv) {
@@ -590,6 +612,47 @@ int main(int argc, char** argv) {
 	int status = loadFromSD(conf, argv[0]);
 	sdFound = (conf->sdFound && !conf->b4dsMode);
 	bootstrapOnFlashcard = conf->bootstrapOnFlashcard;
+
+#if RA_LAUNCHER_WIFI
+	/*
+	    Step two of the RA network ladder, and it never comes back -- a build with
+	    RA_LAUNCHER_WIFI on is a measurement, not a loader. Here rather than earlier because
+	    the log needs the card mounted, and here rather than later because the point is to
+	    run in the launcher, before a game exists to contend for the ARM7.
+	*/
+	myConsoleDemoInit();
+	{
+		/*
+		    Whether the cheat engine is going to run, which is a different question from whether a
+		    cheat file exists -- and this used to ask the second one, as `conf->cheatSize != 0`.
+
+		    That was wrong in both directions, and the direction that matters is the one that let
+		    cheats through. **`cheatData.bin` is only one of three inputs.** nds-bootstrap's own
+		    predicate is `wideCheatSize + cheatSize + (apPatchIsCheat ? apPatchSize : 0) > 4` -- see
+		    main.arm7.c, where `cheatSizeTotal` is built and `cheatsEnabled` is decided from it. A
+		    card with wide cheats and no `cheatData.bin`, or with an AP patch that is really a cheat
+		    file, ran the cheat engine while this said the session was clean.
+
+		    And the other direction is the one a player would notice: `!= 0` refuses hardcore for a
+		    `cheatData.bin` that exists but holds nothing. TWiLight Menu writes that file when the
+		    player *opens* the cheat screen for a game; turning every cheat back off leaves the file
+		    behind, a few bytes long, which is why the real predicate is `> 4` and not `> 0`. Asking
+		    whether the file exists punished a player for having looked.
+
+		    The ceiling is deliberately not reproduced here. `cheatsEnabled` also refuses a total the
+		    cheat engine has no room for, and that limit is computed from the ROM's own layout in the
+		    bootloader -- 0x8000 in one place, a variable derived from 0x4000 in another. A launcher
+		    guess at it would be a fourth copy of a number that already exists twice. Being
+		    over-strict there costs a player hardcore on a card with a 32 KB cheat file, and the
+		    bootloader has the last word anyway: it clears the staged session's hardcore flag when it
+		    installs the engine, at the point where the answer is finally known.
+		*/
+		const u32 cheatBytes = conf->wideCheatSize + conf->cheatSize
+		                       + ((conf->valueBits & BIT(5)) ? conf->apPatchSize : 0);
+
+		raWifiProbe(sdFound, conf->ndsPath, cheatBytes > RA_CHEATS_MIN_BYTES);
+	}
+#endif
 
 	if (status == 0) {
 		status = runNdsFile(conf);

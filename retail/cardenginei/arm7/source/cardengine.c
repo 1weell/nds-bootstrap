@@ -26,8 +26,12 @@
 #include <nds/input.h>
 #include <nds/timers.h>
 #include <nds/arm7/audio.h>
+#include <nds/arm7/clock.h>   /* rtcGetTimeAndDate(), to stamp an unlock with when it was earned */
 #include <nds/arm7/i2c.h>
 #include <nds/memory.h> // tNDSHeader
+/* Step 3b: RA_SHARED_UNLOCK_* -- the contract with the ARM9, in one place rather than two. */
+#include "ra.h"
+#include "ra_wifi.h"   /* RA_QUEUE_RECORD, RA_QUEUE_MAX -- defined whether or not the WiFi switch is on */
 #include <nds/debug.h>
 
 #include "ndma.h"
@@ -106,6 +110,7 @@ extern u32 saveCluster;
 extern u32 saveSize;
 extern u32 patchOffsetCacheFileCluster;
 extern u32 srParamsCluster;
+extern u32 raUnlocksCluster;   /* step 3b; 0 when the launcher found no queue file */
 extern u32 ramDumpCluster;
 extern u32 screenshotCluster;
 extern u32 pageFileCluster;
@@ -169,6 +174,13 @@ static aFile* apFixOverlaysFile = (aFile*)OVL_FILE_LOCATION;
 static aFile patchOffsetCacheFile;
 static aFile ramDumpFile;
 static aFile srParamsFile;
+static aFile raUnlocksFile;
+/*
+    The running game's identity, captured at init because the header it comes from does not survive
+    play. See where these are filled.
+*/
+static char raGameTitle[RA_QUEUE_TITLE];
+static char raGameCode[RA_QUEUE_CODE];
 static aFile screenshotFile;
 static aFile pageFile;
 static aFile manualFile;
@@ -290,6 +302,26 @@ static void driveInitialize(void) {
 	getFileFromCluster(&patchOffsetCacheFile, patchOffsetCacheFileCluster, (valueBits & gameOnFlashcard));
 	getFileFromCluster(&ramDumpFile, ramDumpCluster, (valueBits & bootstrapOnFlashcard));
 	getFileFromCluster(&srParamsFile, srParamsCluster, (valueBits & gameOnFlashcard));
+	/*
+	    Step 3b. Zero when the launcher found no queue file, and getFileFromCluster on zero yields a
+	    file the append path refuses -- see raUnlockAppend(). Same flashcard flag as srParams, because
+	    the queue lives beside the game rather than beside nds-bootstrap.
+	*/
+	getFileFromCluster(&raUnlocksFile, raUnlocksCluster, (valueBits & gameOnFlashcard));
+	/*
+	    And which game this is, taken *now* rather than when an achievement fires.
+
+	    ndsHeader points at the header the loader left in main RAM, and the game reuses that memory
+	    once it is running. Reading it at unlock time therefore works for an achievement earned in the
+	    first seconds and returns nothing for one earned at a stage end minutes later -- which is
+	    exactly what hardware showed: an early unlock carried YCTE and CONTRA 4, a late one carried
+	    neither, from the same build.
+
+	    Copied raw, with the tidying left to raQueueScan() on the launcher side; see raUnlockAppend()
+	    for why this binary does no trimming of its own.
+	*/
+	tonccpy(raGameTitle, ndsHeader->gameTitle, RA_QUEUE_TITLE);
+	tonccpy(raGameCode, ndsHeader->gameCode, RA_QUEUE_CODE);
 	getFileFromCluster(&screenshotFile, screenshotCluster, (valueBits & bootstrapOnFlashcard));
 	getFileFromCluster(&pageFile, pageFileCluster, (valueBits & bootstrapOnFlashcard));
 	getFileFromCluster(&manualFile, manualCluster, (valueBits & bootstrapOnFlashcard));
@@ -334,6 +366,12 @@ static void driveInitialize(void) {
 	driveInited = true;
 }
 
+/* Step 3b: defined far below, beside the rest of the queue code they belong to. */
+static __attribute__((noinline)) void raStampCapture(void);
+#ifndef TWLSDK
+static __attribute__((noinline)) void raUnlockDrain(void);
+#endif
+
 static void initialize(void) {
 	if (initialized) {
 		return;
@@ -365,6 +403,13 @@ static void initialize(void) {
 		toncset((u8*)0x06000000, 0, 0x40000);	// Clear bootloader
 		bootloaderCleared = true;
 	}
+
+	/*
+	    Step 3b: the console's clock, taken here and nowhere else. This is the only moment in this
+	    binary's life when reading the RTC is safe -- the game is setting up its interrupts and has no
+	    main loop to interrupt. See raStampCapture().
+	*/
+	raStampCapture();
 
 	initialized = true;
 }
@@ -769,6 +814,10 @@ static inline void rebootConsole(void) {
 }
 
 void forceGameReboot(void) {
+	/* Step 3b: same as returnToLoader() -- and this path already writes srParamsFile below. */
+	#ifndef TWLSDK
+	raUnlockDrain();
+#endif
 	toncset((u32*)0x02000000, 0, 0x400);
 	*(u32*)0x02000000 = BIT(3);
 	*(u32*)0x02000004 = 0x54455352; // 'RSET'
@@ -813,6 +862,10 @@ extern bool dldiPatchBinary (unsigned char *binData, u32 binSize);
 #endif
 
 void returnToLoader(bool reboot) {
+	/* Step 3b: last chance -- the game is going away. See RA_UNLOCK_PENDING_MAX. */
+	#ifndef TWLSDK
+	raUnlockDrain();
+#endif
 	toncset((u32*)0x02000000, 0, 0x400);
 	*(u32*)0x02000000 = BIT(0) | BIT(1) | BIT(2);
 	*(u32*)0x02000004 = 0x54455352; // 'RSET'
@@ -934,6 +987,305 @@ void returnToLoader(bool reboot) {
 
 	rebootConsole();		// Reboot into TWiLight Menu++
 #endif
+}
+
+/*
+    Step 3b: append one earned achievement id to sd:/ra_unlocks.txt.
+
+    This is the half of the loop with no network in it. rcheevos fires on the ARM9, inside the game's
+    VCOUNT handler, where there is no SD card -- on a DSi the card is this CPU's. So the id crosses
+    through sharedAddr and lands here, and the *next* boot's launcher sends it. See RA_QUEUE_PATH.
+
+    Fixed 16-byte records, so record N is at offset N*16 and no index has to be stored anywhere: the
+    append point is found once, by reading the first byte of each record until one is not a digit. The
+    launcher zero-fills the file and packs the ids it could not send to the front, so that byte is
+    exactly the boundary. Sixty-four one-record reads, on the frame of the first unlock of a session,
+    and never again.
+
+    Refuses rather than grows. The file's length is fixed because this CPU can only write into clusters
+    that already exist -- it cannot allocate -- so a full queue is dropped and counted rather than
+    extended. A session earning sixty-four achievements before a reboot is not a thing.
+
+    The statics are magic-guarded for the same reason the overlay's are: this binary is copied in
+    without a crt0, so .bss holds whatever the previous occupant left and a plain zero means nothing.
+*/
+#define RA_UNLOCK_STATE_MAGIC 0x314C5541   /* 'AUL1' */
+
+/*
+    **Unlocks wait here instead of going to the card while the game is running.**
+
+    This is the fix for the last freeze standing, and it is a removal rather than a mitigation. With
+    the overlay switched off entirely -- no sprites, no borrowed layer, not one write to the game's
+    VRAM -- Ketsui still froze at the boss that awards its first achievement. `queue=3`, which
+    acknowledges the request and touches nothing else, cleared the whole stage. So the only thing
+    left between "plays" and "hangs" was the ARM7 opening the SD card from inside a VBlank handler,
+    with IME off, at the exact moment a bullet-hell is streaming a scene transition.
+
+    Rather than keep bisecting *which* part of that transaction is fatal -- three diagnoses have been
+    wrong already, and each one costs a boss fight to test -- the transaction is moved out of the
+    game's way entirely. On the frame an achievement fires this now does arithmetic and nothing else.
+    The card is opened later, at a moment the game is not using it:
+
+      the in-game menu   inGameMenu() runs from this handler with the game paused under saveMutex,
+                         and already does its own SD I/O for screenshots and the page file
+      leaving the game   returnToLoader() and forceGameReboot(), where the game is being torn down
+
+    **The mode rides in bit 31 of the id**, which is free: RetroAchievements ids are nowhere near
+    2^31, and ra_rc_queue_unlock() already refuses anything at or above RA_SYNTHETIC_ID_BASE before
+    it can reach this side. One word per unlock instead of two, on the binary that has the least
+    room -- cardenginei_arm7 for TWL-SDK games links into 33K with forty-four bytes spare.
+
+    One queue worth of RAM slots on NTR, with the ARM9's eight-slot ring behind them: it will not offer a new request
+    while the last is unacknowledged, so a full buffer here means the ring holds the rest rather than
+    anything being dropped. Backpressure retains requests while those slots are full.
+
+    What this costs, said plainly: an unlock that has not been drained does not survive the console
+    being switched off mid-session. Quitting the game normally drains it; pulling the power does not.
+    That is strictly better than the `queue=0` this replaces, where nothing survived at all.
+*/
+#ifndef TWLSDK
+#define RA_UNLOCK_PENDING_MAX RA_QUEUE_MAX
+#define RA_UNLOCK_HARDCORE_BIT 0x80000000u
+
+static u32 raUnlockPending[RA_UNLOCK_PENDING_MAX];
+static u8  raUnlockPendingCount;
+#endif
+
+static u32 raUnlockStateMagic;
+static u8  raUnlockSlot;      /* next record to write, RA_QUEUE_MAX when full */
+
+/*
+    Initialised, and **in .data rather than .bss**, which is what lets the read path be a bare copy
+    with no validity magic and no branch in front of it.
+
+    Every other static this feature owns is magic-guarded, because .bss in an injected binary holds
+    whatever the previous occupant left and a plain zero means nothing. An initialised array is a
+    different thing: it is part of the image the bootloader copies in, so it arrives holding exactly
+    these fourteen bytes whether or not anything has run yet.
+
+    And they are chosen to be the safe answer. `20000000000000` is well formed and has month 00, so
+    raQueueStampToUnix() refuses it and the launcher submits without `o=` -- the same outcome
+    `queue=2` produces on purpose. So a capture that somehow never happened costs an unlock its date
+    and nothing else, with no code spent checking for a case that cannot occur.
+*/
+static char raStampCache[RA_QUEUE_STAMP] = "20000000000000";
+
+/*
+    The console's clock as `YYYYMMDDhhmmss`, **read once, at init, and never again while a game runs.**
+
+    That last part is the whole point of this function existing separately, and it is a fix rather than
+    a tidy-up. Reading the RTC on the frame an achievement fires is what froze Ketsui, confirmed by
+    bisection: `queue=1` hangs on the boss kill, `queue=2` -- identical in every respect except that it
+    skips this read -- clears the same stage. `queue=3` and `queue=0` clear it too. One variable.
+
+    Two ways it can hurt and this fork does not need to know which, because the fix removes both:
+
+      duration   rtcTransaction() bit-bangs RTC_CR8 with swiDelay(48) on every clock edge, and
+                 rtcGetTimeAndDate() does two of them -- about 166 delays, near a millisecond, spent
+                 inside the VBlank handler with the I bit set. That is a millisecond in which the FIFO
+                 handler is not answering the ARM9's card reads, at the one moment a bullet-hell
+                 shooter has least to spare.
+
+      collision  the RTC is a serial bus with a chip select, and plenty of DS games read it from their
+                 own ARM7. Our handler interrupts the game's main loop; if that loop was mid
+                 transaction, driving CS and SCK underneath it destroys the transaction, and the reply
+                 the game is waiting for never comes.
+
+    Called from initialize(), which runs when the game sets up its interrupts -- before its main loop
+    exists, so neither hazard applies there.
+
+    **What this costs is accuracy, and it is stated rather than hidden.** Every unlock in a session is
+    now stamped with the moment the session started, not the moment it fired. An hour into a long
+    session that is an hour of error. Measured against what it replaces that is still the right trade:
+    without `o=` at all the server dates an unlock by the boot that *reported* it, which with this
+    client can be the next day. Session-start is never worse than that and usually far better.
+
+    The exact version is designed and not built, because it does not fit here: the ARM7 would count
+    VBlanks and add the elapsed seconds to the captured time, and the day rollover would go to the
+    launcher, which owns the calendar and has host tests behind it. That is 60-100 bytes of division
+    by constants on a binary with sixty spare. See "What is left" in docs/retroachievements.md.
+
+    rtcGetTimeAndDate() hands back plain integers, not BCD -- it masks the 12/24-hour bit and calls
+    BCDToInteger(t, 7) itself before returning, which is what the disassembly of libnds7 shows. The one
+    thing it does not normalise is the PM flag in 12-hour mode, where the hour comes back with 40 added
+    to it (RTCtime's own comment: "0 to 11 for AM, 52 to 63 for PM"). Subtracting it is a no-op on a
+    console set to 24 hours and the difference between 21:xx and 61:xx on one set to 12.
+
+    **Not validated here, on purpose.** raQueueStampToUnix() already refuses any date it will not vouch
+    for -- a console whose clock was never set reads as year 0 and comes out as `2000...`, below its
+    floor -- and it is the copy with a host test behind it. Checking the same ranges twice cost this
+    binary bytes it does not have.
+
+    Only the digits are written here and none of the arithmetic. Turning them into seconds is the
+    launcher's job, which keeps the calendar -- leap years, month lengths, the epoch -- on the side
+    that has a host test, and keeps this side to a copy loop.
+*/
+static __attribute__((noinline)) void raStampCapture(void) {
+	char* const out = raStampCache;
+	RTCtime now;
+	u8      field[5];
+	u8      hours;
+	int     f;
+	int     at = 0;
+
+	rtcGetTimeAndDate((uint8*)&now);
+	hours = now.hours;
+	if (hours >= 40) {
+		hours -= 40;
+	}
+
+	field[0] = now.month;
+	field[1] = now.day;
+	field[2] = hours;
+	field[3] = now.minutes;
+	field[4] = now.seconds;
+
+	out[at++] = '2';
+	out[at++] = '0';
+	out[at++] = (char)('0' + (now.year / 10));
+	out[at++] = (char)('0' + (now.year % 10));
+	for (f = 0; f < 5; f++) {
+		out[at++] = (char)('0' + (field[f] / 10));
+		out[at++] = (char)('0' + (field[f] % 10));
+	}
+}
+
+
+/* my_fat.c's sector cache; the queue may be on either card, so both are cleared. */
+extern int prevSect[2];
+
+static __attribute__((optimize("Os"))) bool raUnlockAppend(u32 id, int hardcore) {
+	char record[RA_QUEUE_RECORD];
+	char digits[11];
+	u32  value = id;
+	int  n = 0;
+	int  i;
+
+	if (raUnlocksCluster == 0 || id == 0) {
+		return false;
+	}
+
+	if (raUnlockStateMagic != RA_UNLOCK_STATE_MAGIC) {
+		u8 slot;
+
+		/*
+		    Once before the first read, for the reason fileWrite() forces its own: a partial read is
+		    served out of a buffer shared with the running game's card traffic, and this scan read a
+		    digit where the file held a NUL and put the record in slot 1 with slot 0 empty. One clear
+		    rather than one per iteration -- the first read is the one that decides, and this binary
+		    is the tightest in the tree. Written inline rather than through resetPrevSect() for the
+		    same reason: the call plus the retained function body did not fit.
+		*/
+		prevSect[0] = -1;
+		prevSect[1] = -1;
+
+		for (slot = 0; slot < RA_QUEUE_MAX; slot++) {
+			if (fileRead(record, &raUnlocksFile, slot * RA_QUEUE_RECORD, 1) != 1) return false;
+			if (record[0] < '0' || record[0] > '9') {
+				break;
+			}
+		}
+		raUnlockSlot = slot;
+		raUnlockStateMagic = RA_UNLOCK_STATE_MAGIC;
+	}
+
+	if (raUnlockSlot >= RA_QUEUE_MAX) {
+		return false;
+	}
+
+	while (value && n < (int)sizeof(digits)) {
+		digits[n++] = (char)('0' + (value % 10));
+		value /= 10;
+	}
+	toncset(record, 0, RA_QUEUE_RECORD);
+	for (i = 0; i < n; i++) {
+		record[i] = digits[n - 1 - i];
+	}
+	record[n] = '\n';
+
+	/*
+	    Use the timestamp captured at session start; no RTC transaction here.
+	    The launcher may send o= relative to that approximate time. See RA_QUEUE_PATH.
+	*/
+	{
+		const char* stamp = raStampCache;
+		int at = n;
+
+		record[at++] = '\t';
+		for (i = 0; i < RA_QUEUE_STAMP; i++) {
+			record[at++] = stamp[i];
+		}
+
+		/*
+		    And which game it came from -- `gameCode` identifies the release and `gameTitle` is what a
+		    human reads. No network and nothing passed down from the launcher, which is what the case
+		    this exists for demands: a queue full of one game's unlocks while another is running and
+		    there is no WiFi to drain it.
+
+		    Read from the copies taken at init, **not** from ndsHeader here. That header is the
+		    loader's and the game reuses its memory once running, so reading it on the frame an
+		    achievement fires works early in a session and returns nothing later in one.
+
+		    Both are fixed-width fields that are *not* NUL-terminated and are padded with spaces, and
+		    neither is guaranteed to be text at all -- a homebrew ROM can put anything there. So
+		    anything outside printable ASCII stops the copy, which also keeps a stray tab or newline
+		    from inventing a field boundary in a record that is delimited by them.
+		*/
+		/*
+		    And which game it came from, out of the running ROM's own header -- `gameCode` identifies
+		    the release and `gameTitle` is what a human reads. No network, nothing passed down from the
+		    launcher, and available on the frame the achievement fires, which is what the case this
+		    exists for demands: a queue full of one game's unlocks while another is running and there
+		    is no WiFi to drain it.
+
+		    **Copied raw, and the tidying happens in the launcher.** Both fields are fixed width, are
+		    not NUL-terminated, are padded with spaces or NULs, and are not guaranteed to be text at
+		    all. Trimming and range-checking them here cost more than this binary has: cardenginei_arm7
+		    for TWL-SDK games links into 33K and had **76 bytes** spare before this field existed. So
+		    the bytes go out as they are and raQueueScan() stops at the first one that is not printable
+		    and drops trailing padding -- which it already did.
+
+		    Copied with tonccpy() rather than a loop, and that is a size decision measured rather than
+		    guessed: a loop with a constant bound of twelve is one gcc unrolls into twelve load/store
+		    pairs, which cost this binary 264 bytes it does not have.
+
+		    It is the same split as the stamp, for the same reason: this side writes bytes, the side
+		    with a host test interprets them. The worst a hostile header can do is garble its own
+		    display name -- the id and the stamp are written before it and are not reachable from here.
+		*/
+		record[at++] = '\t';
+		tonccpy(record + at, raGameCode, RA_QUEUE_CODE);
+		at += RA_QUEUE_CODE;
+		record[at++] = '\t';
+		tonccpy(record + at, raGameTitle, RA_QUEUE_TITLE);
+		at += RA_QUEUE_TITLE;
+
+		/*
+		    And which mode it was earned in, so the boot that sends it cannot decide that for itself.
+
+		    Without this the mode came from ra.cfg at submission time, which meant a player could earn
+		    unlocks in softcore with the menu's RAM editor open, set hardcore=1, boot, and watch them
+		    go out as hardcore. The record is the only place that can hold the truth, because it is
+		    the only thing that survives from the session that earned it to the boot that sends it.
+
+		    Last, because the fields are positional and everything before it already shipped. A record
+		    that lost its stamp has no game either and now has no mode either, and reads as softcore:
+		    the fail-safe direction, and the same thing an older build's records read as.
+
+		    Two characters, and the record was sized for them -- 44 bytes used of 48 before this, 46
+		    after. This binary is the tightest in the tree, so it writes a byte it is handed rather
+		    than deciding anything: `hardcore` came across in the request's own magic.
+		*/
+		record[at++] = '\t';
+		record[at++] = hardcore ? '1' : '0';
+		record[at] = '\n';
+	}
+
+	if (fileWrite(record, &raUnlocksFile, raUnlockSlot * RA_QUEUE_RECORD, RA_QUEUE_RECORD) != RA_QUEUE_RECORD) {
+		return false;
+	}
+	raUnlockSlot++;
+	return true;
 }
 
 void dumpRam(void) {
@@ -1411,6 +1763,149 @@ static bool readOngoing = false;
 //static bool ongoingIsDma = false;
 //static int currentCmd=0, currentNdmaSlot=0;
 //static int timeTillDmaLedOff = 0;
+
+/*
+    Step 3b: an achievement the ARM9 earned, on its way to the queue file.
+
+    A critical section and no mutex, and that is a considered choice rather than an omission. The mutex
+    the old ramDump path used, cardEgnineCommandMutex, is commented out at its declaration -- dead code
+    -- and taking a private one would protect nothing, because the card-read path would not be taking
+    it. What IME off does buy is that a competing read cannot *start* underneath this write, and on this
+    CPU reads are driven from interrupt handlers.
+
+    That was the whole of the argument, and it was not enough: see raCardReadPending() in ra.h, which
+    carries the reasoning and the measurements. A read does not have to start underneath the write to
+    be ruined by it -- it can already be half done, outstanding on the SD controller, with nothing but
+    a command id and 512 bytes of shared buffer standing in for it. So `readOngoing` is checked here
+    as well as IME held off, and the ARM9 does not even raise the request while a read of its own is
+    unserved.
+
+    The cost of the section is that an ARM9 read request waits a few milliseconds -- a stall, not
+    corruption -- and only on the frame an achievement unlocks.
+
+    The request word is cleared after the append, not before, so a frame that could not do the work
+    leaves the request standing and the next one retries. That is what makes waiting free.
+
+    **A function, explicitly noinline, rather than a block inside myIrqHandlerVBlank -- and that is
+    measured rather than tidiness.** cardenginei_arm7 for TWL-SDK games links into 33K with 60 bytes
+    spare, so where code sits is a size decision here. This block used to be inlined into the handler,
+    which was 1860 bytes of straight-line code, and every arrangement was weighed against the region
+    (text of this translation unit, baseline 7737):
+
+      one bool test added to the condition, in place       7829   +92
+      the two-word predicate added in place                7905  +168
+      lifted to a function, gcc inlined it back            7817   +80
+      lifted, noinline, both halves of the predicate       7793   +56  -- .bss 4 bytes past the region
+      lifted, noinline, `readOngoing` only                 7753   +16  -- this
+
+    Ninety-two bytes for one bool test is register pressure across a 1860-byte function, not the test.
+    Lifted out, the handler drops to 1260 and this function is 612, and the test costs what a test
+    costs. The last two lines are also why the other half of the wait runs on the ARM9: four bytes.
+    See raCardReadPending().
+
+    Two magics, one request, and the mode is which of them arrived -- see RA_SHARED_UNLOCK_HARDCORE.
+    Read once into a local because the ARM9 may not write this word while it is non-zero, but reading
+    it twice would still be two loads of a volatile for one answer.
+*/
+static void raUnlockService(void) {
+	const u32 req = sharedAddr[RA_SHARED_UNLOCK_REQ];
+
+	if (req != RA_SHARED_UNLOCK_MAGIC && req != RA_SHARED_UNLOCK_HARDCORE) {
+		return;
+	}
+
+#ifdef TWLSDK
+	/*
+	    **TWL-SDK keeps the old path, and that is want of a hundred bytes rather than a decision.**
+
+	    Deferring costs 136 bytes of text and 28 of .bss, measured; this binary links into 33K with
+	    forty-four spare. Every arrangement worth trying was tried -- a three-slot buffer, the service
+	    inlined back into the handler -- and it still lands a hundred over.
+
+	    So DSi-enhanced titles keep exactly what they have today: the append runs here, in the VBlank
+	    handler, with the hazard that is documented at raUnlockDrain(). That is not a regression --
+	    it is what every game did until now -- but it is not the fix either, and pretending otherwise
+	    by shipping a half-deferral that overflowed the region would be worse than saying so.
+	    Everything this was built to rescue is NTR: Ketsui, Contra 4, Chrono Trigger all load
+	    cardenginei_arm7, which has 11K spare.
+	*/
+	if (readOngoing) {
+		return;
+	}
+	{
+		const int oldIME = enterCriticalSection();
+
+		const bool appended = raUnlockAppend(sharedAddr[RA_SHARED_UNLOCK_ID],
+		                                    req == RA_SHARED_UNLOCK_HARDCORE);
+		leaveCriticalSection(oldIME);
+		if (!appended) return;
+	}
+#else
+	/*
+	    RA_QUEUE_LEVEL_HANDOFF still means "acknowledge and do nothing" -- the instrument that proved
+	    the append was the last thing hanging the game. See RA_SHARED_UNLOCK_LEVEL.
+	*/
+	if (sharedAddr[RA_SHARED_UNLOCK_LEVEL] != RA_QUEUE_LEVEL_HANDOFF) {
+		/*
+		    Arithmetic and nothing else on the frame an achievement fires: no card, no critical
+		    section, no RTC. See RA_UNLOCK_PENDING_MAX.
+
+		    A full buffer is left alone rather than overwritten. The request word stays set, the ARM9
+		    stops offering and holds the rest in its own eight-slot ring, and the next drain unblocks
+		    both -- so the flag is cleared only once the id is safely held.
+		*/
+		if (raUnlockPendingCount >= RA_UNLOCK_PENDING_MAX) {
+			return;
+		}
+		raUnlockPending[raUnlockPendingCount++] =
+			sharedAddr[RA_SHARED_UNLOCK_ID]
+			| ((req == RA_SHARED_UNLOCK_HARDCORE) ? RA_UNLOCK_HARDCORE_BIT : 0);
+	}
+#endif
+	sharedAddr[RA_SHARED_UNLOCK_REQ] = 0;
+}
+
+/*
+    ...and here is where the card is actually opened: with the game paused or on its way out.
+
+    Called from the two places the ARM7 is not competing with a running game -- after inGameMenu()
+    returns, and on the way through returnToLoader() and forceGameReboot(). Cheap to call when there
+    is nothing to write, which is almost always.
+
+    The critical section is still taken, for what it was always worth: it keeps a card read from
+    starting underneath the write. What it never protected against was the game needing the card at
+    that instant, and that is now impossible rather than unlikely.
+*/
+#ifndef TWLSDK
+static __attribute__((noinline)) void raUnlockDrain(void) {
+	int oldIME;
+	u8  i;
+
+	if (raUnlockPendingCount == 0) {
+		return;
+	}
+
+	oldIME = enterCriticalSection();
+	for (i = 0; i < raUnlockPendingCount; i++) {
+		const u32 packed = raUnlockPending[i];
+
+		if (!raUnlockAppend(packed & ~RA_UNLOCK_HARDCORE_BIT,
+		                    (packed & RA_UNLOCK_HARDCORE_BIT) != 0)) {
+			break;
+		}
+	}
+	/* Keep records the queue could not accept for a later drain. */
+	if (i) {
+		u8 remaining = raUnlockPendingCount - i;
+		u8 j;
+		for (j = 0; j < remaining; j++) {
+			raUnlockPending[j] = raUnlockPending[i + j];
+		}
+		raUnlockPendingCount = remaining;
+	}
+	leaveCriticalSection(oldIME);
+}
+#endif
 
 static bool start_cardRead_arm9(void) {
 	bool useApFixOverlays = false;
@@ -1924,6 +2419,14 @@ void myIrqHandlerVBlank(void) {
 #ifdef TWLSDK
 		i2cWriteRegister(0x4A, 0x12, 0x01);
 #endif
+		/*
+		    Step 3b: the game is paused and the card is ours -- inGameMenu() has just been using it
+		    itself for screenshots and the page file. This is where the deferred unlocks are written.
+		    See RA_UNLOCK_PENDING_MAX.
+		*/
+		#ifndef TWLSDK
+	raUnlockDrain();
+#endif
 		unlockMutex(&saveMutex);
 		}
 	}
@@ -1989,6 +2492,13 @@ void myIrqHandlerVBlank(void) {
 	} else {
 		ramDumpTimer = 0;
 	} */
+
+	raUnlockService();
+	/* Independent of the SD award queue; never reads WRAM or waits for ARM11. */
+	{
+		extern void raBridgeArm7(volatile u32* shared);
+		raBridgeArm7(sharedAddr);
+	}
 
 	if (sharedAddr[3] == (vu32)0x52534554) {
 		reset(false);

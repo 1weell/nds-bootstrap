@@ -10,6 +10,7 @@
 
 #include "igm_text.h"
 #include "locations.h"
+#include "ra_wifi.h"   /* raPendingBlock -- the tally the launcher staged */
 #include "cardengine_header_arm9.h"
 #include "nds_header.h"
 #include "tonccpy.h"
@@ -29,6 +30,52 @@ static u16 palBak[256];
 
 // For RAM viewer, global so it's persistant
 vu32 *address = (vu32*)0x02000000;
+
+/*
+    Ranges the ARM9 can actually read here. The RAM viewer's `address` is edited a hex
+    digit at a time and then dereferenced with no check at all, so a single mistyped
+    digit -- 0x52413153 instead of 0x027FEF10, say -- is a Data Abort and the red
+    exception screen.
+
+    Worse, `address` is a deliberately persistent global so the viewer reopens where you
+    left it, which means a poisoned value faults again on every re-entry, before you can
+    reach the keys to correct it. The only way out is rebooting the game.
+
+    So an address outside every real region snaps back to the start of main RAM instead.
+    The list is deliberately generous -- viewing I/O, VRAM, DSi WRAM and the extended RAM
+    above 0x0C000000 are all legitimate things to do with this tool -- because the point
+    is to catch a typo, not to police where you look.
+*/
+static const u32 ramViewerRanges[][2] = {
+	{ 0x02000000, 0x03000000 },  /* main RAM */
+	{ 0x03000000, 0x04000000 },  /* shared WRAM and DSi WRAM */
+	{ 0x04000000, 0x04001100 },  /* I/O registers */
+	{ 0x05000000, 0x05000800 },  /* palette RAM */
+	{ 0x06000000, 0x07000000 },  /* VRAM, all banks */
+	{ 0x07000000, 0x07000800 },  /* OAM */
+	{ 0x08000000, 0x0A000000 },  /* GBA slot */
+	{ 0x0C000000, 0x0E000000 },  /* the extended RAM a DSi and 3DS expose */
+};
+
+/*
+    Called before every read and after every navigation step. One screen is 23 rows of
+    16 bytes, so the whole of what is about to be displayed has to be inside a range,
+    not just the first byte.
+*/
+static void clampAddress(void) {
+	const u32 span = 23 * 0x10;
+	unsigned int i;
+
+	for (i = 0; i < sizeof(ramViewerRanges) / sizeof(ramViewerRanges[0]); i++) {
+		if ((u32)address >= ramViewerRanges[i][0]
+		 && (u32)address <= ramViewerRanges[i][1] - span) {
+			return;
+		}
+	}
+
+	address = (vu32*)0x02000000;
+}
+
 static bool arm7Ram = false;
 static u8 arm7RamBak[0xC0];
 
@@ -236,6 +283,21 @@ static void waitKeys(u16 keys) {
 
 void clearScreen(bool main) {
 	toncset16(main ? BG_MAP_RAM(15) : BG_MAP_RAM_SUB(15), 0, 0x300);
+}
+
+/* Status refreshes wake waitKeys without a key. Require a fresh press so
+ * the A that opened an RA page cannot activate its first action. */
+static u16 raWaitKeys(u16 keys) {
+	while (KEYS & keys) {
+		while (REG_VCOUNT != 191) mySwiDelay(100);
+		while (REG_VCOUNT == 191) mySwiDelay(100);
+	}
+	u16 pressed;
+	do {
+		waitKeys(keys);
+		pressed = KEYS & keys;
+	} while (!pressed);
+	return pressed;
 }
 
 bool boolQuestion(const unsigned char *str) {
@@ -487,6 +549,623 @@ static void drawMainMenu(MenuItem *menuItems, int menuItemCount) {
 	#endif
 }
 
+/* Two game codes, compared without pulling string.h into a cardengine. Both are NUL-terminated. */
+static bool sameCode(const char* a, const char* b) {
+	int i;
+
+	for (i = 0; i <= RA_QUEUE_CODE; i++) {
+		if (a[i] != b[i]) {
+			return false;
+		}
+		if (a[i] == 0) {
+			return true;
+		}
+	}
+	return true;
+}
+
+/*
+    A number right-aligned in `width` cells, without printDec()'s leading zeros.
+
+    printDec() writes exactly the digits it is asked for, taken from the low end -- so a count of 101
+    in two cells prints `01`, which is what the achievements header did on *Chrono Trigger*: a set of
+    a hundred and one read as a set of one. It was never a counting fault, and it would have gone on
+    reading plausibly wrong on every set past ninety-nine.
+
+    Widening the field alone is not the fix, because printDec() pads with zeros: three cells turn a
+    forty-five-achievement set into `045`. The screen is cleared at the top of every draw, so the
+    leading cells are already blank and the number only has to be placed -- which is all this does.
+
+    Clamped at `width` cells rather than overrunning: a value too large for the field loses its top
+    digits, which is the old bug in miniature, but RA_VIEWER_MAX_ENTRIES is 128 and every caller here
+    passes 3.
+*/
+/*
+    Three cells is enough for every count this menu shows, and it is checked rather than believed:
+    the field that was too small is exactly what this function exists to stop happening again.
+*/
+typedef char raCountFitsThreeCells[(RA_VIEWER_MAX_ENTRIES <= 999 && RA_QUEUE_MAX <= 99) ? 1 : -1];
+
+static void raPrintNum(int x, int y, int width, u32 val, FontPalette palette) {
+	int digits = 1;
+	u32 rest   = val;
+
+	while (rest >= 10) {
+		rest /= 10;
+		digits++;
+	}
+	if (digits > width) {
+		digits = width;
+	}
+	printDec(x + width - digits, y, val, digits, palette, false);
+}
+
+/*
+    RetroAchievements: what is earned and not yet sent.
+
+    One line per game, three fields -- the game, how many of its unlocks are still owed, and how long
+    the oldest has waited. Counts rather than a list of achievements, because achievement titles only
+    exist in the staged definitions of the game that is *running*: a list could name the current game's
+    unlocks and could only ever print bare ids for every other game, and the other games are exactly
+    what this page exists to show. The player was already told which achievement by the notification,
+    with its name, when it fired.
+
+    The block is read where the bootloader put it, and its magic is what says a boot actually staged
+    one. An unset window reads as whatever the previous occupant left, so "no magic" and "nothing
+    pending" have to look different here -- the first is a boot that never looked.
+*/
+static void raPendingPage(void) {
+	const raPendingBlock* b = (const raPendingBlock*)CARDENGINEI_ARM9_RA_PENDING_LOCATION;
+	int line;
+	int shown = 0;
+
+	clearScreen(false);
+	print(0, 0, igmText.raMenu[RA_MENU_SYNC_PENDING], FONT_WHITE, false);
+
+	if (b->magic != RA_PENDING_MAGIC) {
+		print(0, 2, (unsigned char*)"No queue was read this boot", FONT_LIGHT_GRAY, false);
+	} else if (b->total + b->session == 0) {
+		print(0, 2, (unsigned char*)"Nothing waiting to sync", FONT_LIME, false);
+	} else {
+		/*
+		    Two cells, not one. The queue holds up to RA_QUEUE_MAX records and a single cell showed
+		    the low digit of anything past nine -- twelve waiting read as two. Same defect as the
+		    achievements header, one page away, found while fixing that one.
+		*/
+		raPrintNum(0, 2, 2, (u32)(b->total + b->session), FONT_WHITE);
+		print(3, 2, (unsigned char*)"waiting to sync", FONT_WHITE, false);
+
+		line = 4;
+		for (int i = 0; i < b->games && line < 19; i++, line++) {
+			/*
+			    This session's unlocks belong to the running game, and they are not in the block's
+			    counts: the launcher tallied the queue as it stood at boot, and everything earned
+			    since then was written by the ARM7 afterwards. Folded in here rather than staged,
+			    because the number changes while the menu is closed.
+			*/
+			const int mine  = (b->thisCode[0] && sameCode(b->game[i].code, b->thisCode));
+			const int count = b->game[i].count + (mine ? b->session : 0);
+
+			print(1, line, (unsigned char*)b->game[i].title, FONT_WHITE, false);
+			printDec(15, line, count, 2, FONT_LIGHT_BLUE, false);
+			if (mine)
+				shown = 1;
+
+			/*
+			    Days, not a date. Five characters cannot tell 08/09 the ninth of August from the
+			    eighth of September, and what this column is for is how long something has been
+			    stuck. The launcher does the subtraction at boot -- it has a real clock, which in
+			    here nothing does: sharedAddr[7]/[8] carry hours and minutes and no date at all.
+			*/
+			if (b->game[i].waitDays == 0)
+				printRight(31, line, (unsigned char*)"today", FONT_LIGHT_GRAY, false);
+			else if (b->game[i].waitDays == 1)
+				printRight(31, line, (unsigned char*)"yesterday", FONT_LIGHT_GRAY, false);
+			else {
+				printDec(24, line, b->game[i].waitDays, 3, FONT_LIGHT_GRAY, false);
+				print(28, line, (unsigned char*)"days", FONT_LIGHT_GRAY, false);
+			}
+		}
+
+		/*
+		    The running game earned its first unlocks this session, so the queue had no row for it at
+		    boot and the loop above drew none. Without this the most common case of all -- a fresh
+		    game, one achievement, open the menu to check -- would show an empty page.
+		*/
+		if (!shown && b->session && b->thisTitle[0] && line < 19) {
+			print(1, line, (unsigned char*)b->thisTitle, FONT_WHITE, false);
+			printDec(15, line, b->session, 2, FONT_LIGHT_BLUE, false);
+			printRight(31, line, (unsigned char*)"today", FONT_LIGHT_GRAY, false);
+			line++;
+		}
+
+		/* Said rather than folded away: a screen that under-reports what is owed is worse. */
+		if (b->dropped) {
+			raPrintNum(1, line + 1, 2, b->dropped, FONT_RED);
+			print(4, line + 1, (unsigned char*)"more game(s) not shown", FONT_RED, false);
+			line++;
+		}
+		if (b->unnamed) {
+			raPrintNum(1, line + 1, 2, b->unnamed, FONT_LIGHT_GRAY);
+			print(4, line + 1, (unsigned char*)"of unknown origin", FONT_LIGHT_GRAY, false);
+		}
+	}
+
+	print(0, 21, (unsigned char*)"Sent on the next boot with wifi", FONT_DARKER_GRAY, false);
+	print(0, 23, igmText.bNo, FONT_WHITE, false);
+
+	waitKeys(KEY_B);
+}
+
+/*
+    RetroAchievements: this game's set, earned and still to earn.
+
+    Read through the index cardenginei_arm9_ra built at init, never by parsing the block -- see
+    CARDENGINEI_ARM9_RA_VIEWER_LOCATION for why that is not a preference. The offsets are relative
+    to the definitions text, which is the one address both binaries can name.
+
+    Two levels, because 32 columns cannot hold a title, its points and its description at once. The
+    list gives one line each -- a mark, the title, the points -- and A opens the description of the
+    line under the cursor. That split is also what keeps the page useful on a large set: forty
+    achievements are eight screens of one line and forty screens of three.
+*/
+/* Runtime state only; no card or network I/O from the running game. */
+static void raDiagnostics(const raViewerBlock* v) {
+	const u16 d = v->diagnostics;
+	if (d & 0x800) {
+		print(1, 22, (unsigned char*)"Unlock buffer overflow", FONT_RED, false);
+	} else {
+		print(1, 22, (unsigned char*)"Eval:  Parts:   Fast:", FONT_DARKER_GRAY, false);
+		raPrintNum(6, 22, 1, d & 15, FONT_LIGHT_GRAY);
+		raPrintNum(14, 22, 1, (d >> 4) & 15, FONT_LIGHT_GRAY);
+		raPrintNum(21, 22, 1, (d >> 8) & 7, FONT_LIGHT_GRAY);
+		if (d & 0x1000) print(23, 22, (unsigned char*)"skip", FONT_RED, false);
+	}
+}
+
+static void raAchievementsPage(void) {
+	const raViewerBlock* const v = (const raViewerBlock*)CARDENGINEI_ARM9_RA_VIEWER_LOCATION;
+	const char* const          text = (const char*)(CARDENGINEI_ARM9_RA_DEFS_LOCATION
+	                                                + CARDENGINEI_ARM9_RA_DEFS_HEADER);
+	/* Rows 3 to 21 hold the list, so nineteen entries a screen. */
+	const int rows = 19;
+	int       top = 0;
+	int       cursor = 0;
+
+	if (v->magic != RA_VIEWER_MAGIC || v->count == 0) {
+		clearScreen(false);
+		print(1, 0, igmText.raMenu[RA_MENU_ACHIEVEMENTS], FONT_WHITE, false);
+		/*
+		    Two states and they are not the same. No magic means this boot staged nothing -- no
+		    network, or a game the server does not know. A magic with no entries would mean a set
+		    that arrived empty, which is what an unsupported ROM's own set looks like.
+		*/
+		print(1, 2, (v->magic == RA_VIEWER_MAGIC)
+		            ? (unsigned char*)"This game has no achievements"
+		            : (unsigned char*)"No set was staged this boot", FONT_LIGHT_GRAY, false);
+		if (v->magic == RA_VIEWER_MAGIC) raDiagnostics(v);
+		print(1, 23, igmText.bNo, FONT_WHITE, false);
+		waitKeys(KEY_B);
+		return;
+	}
+
+	while (1) {
+		int i;
+
+		clearScreen(false);
+		/*
+		    Column 1, not 0, and the header is the reason this note is here twice. drawCursor()
+		    clears column 0 of every row to erase the previous caret, so a title printed at 0 loses
+		    its first letter the moment the cursor is drawn -- which on hardware read `chievements`,
+		    and `02 of 45` as `2 of 45`. Nothing on this page may start at column 0.
+		*/
+		print(1, 0, igmText.raMenu[RA_MENU_ACHIEVEMENTS], FONT_WHITE, false);
+		/*
+		    Three cells each, because RA_VIEWER_MAX_ENTRIES is 128 and two cells silently showed the
+		    low two digits of anything larger -- see raPrintNum().
+		*/
+		/*
+		    **The count is earned plus queued**, and that is the fix for a line that read
+		    `0 of 54 earned  2 sync` after unlocking two achievements. Zero is not what a player who
+		    just earned two of them should be looking at.
+
+		    An achievement that has fired but not been sent **is earned**. It is the same thing the
+		    list under this line marks with a star, and it is what the percentage at the right-hand
+		    end has always counted -- so the big number was the one field on this page disagreeing
+		    with every other. What `sync` reports is not a different kind of achievement, it is the
+		    server's acknowledgement still being owed.
+
+		    Safe to add because the two are **disjoint by construction**, not by luck: ra_viewer_add()
+		    only sets RA_VIEWER_QUEUED on an entry that does not already carry RA_VIEWER_EARNED, so
+		    an unlock is in exactly one of the two counts and crosses over on the boot that submits
+		    it. Widened to u32 for the same reason the percentage is: the counts come from a block
+		    another binary wrote.
+		*/
+		raPrintNum(1, 1, 3, (u32)v->earned + (u32)v->queued, FONT_LIME);
+		print(5, 1, (unsigned char*)"of", FONT_LIGHT_GRAY, false);
+		raPrintNum(8, 1, 3, v->count, FONT_WHITE);
+		print(12, 1, (unsigned char*)"earned", FONT_LIGHT_GRAY, false);
+		if (v->queued) {
+			raPrintNum(19, 1, 3, v->queued, FONT_RED);
+			print(23, 1, (unsigned char*)"sync", FONT_LIGHT_GRAY, false);
+		}
+		/*
+		    How far through the set this account is, at the right-hand end of the same line.
+
+		    **Queued counts.** An achievement that has fired but not been sent is earned -- it is the
+		    same thing the list marks with a star -- and a percentage that ignored it would fall
+		    behind the stars on the page under it. The two counts are disjoint in practice: QUEUED is
+		    this console's word for an unlock, EARNED is the server's answer, and an unlock crosses
+		    from one to the other on the boot that submits it.
+
+		    Clamped at 100 rather than trusted: the counts come from a block another binary wrote.
+		*/
+		{
+			const u32 done    = (u32)v->earned + (u32)v->queued;   /* the same sum as the count above */
+			u32       percent = v->count ? (done * 100) / v->count : 0;
+
+			if (percent > 100) {
+				percent = 100;
+			}
+			raPrintNum(28, 1, 3, percent, FONT_LIGHT_BLUE);
+			print(31, 1, (unsigned char*)"%", FONT_LIGHT_BLUE, false);
+		}
+
+		for (i = 0; i < rows && top + i < v->count; i++) {
+			const raViewerEntry* const e = &v->entry[top + i];
+			const int                  earned = (e->flags & RA_VIEWER_EARNED) != 0;
+			const int                  queued = (e->flags & RA_VIEWER_QUEUED) != 0;
+
+			/*
+			    A mark rather than a colour alone: the two palettes are close enough on a lit DS
+			    screen that a photograph of this page could not settle which row was which, and this
+			    project reads a lot of photographs.
+
+			    Column 0 is not available for it. drawCursor() writes the caret there and *clears
+			    that column on every row* to erase the previous one, so a mark at 0 would survive
+			    exactly until the cursor moved.
+			*/
+			/*
+			    Three states, and the middle one is the one a player actually wants: earned on the
+			    server, earned and still in the queue, not earned. Queued keeps the star because it
+			    *is* earned -- what it is missing is the server's acknowledgement, and red says that
+			    without pretending it did not happen.
+			*/
+			print(1, 3 + i, (unsigned char*)((earned || queued) ? "*" : "-"),
+			      earned ? FONT_LIME : (queued ? FONT_RED : FONT_DARKER_GRAY), false);
+			if (e->titleOff) {
+				print(3, 3 + i, (unsigned char*)(text + e->titleOff),
+				      earned ? FONT_LIGHT_GRAY : FONT_WHITE, false);
+			}
+			if (e->pointsOff) {
+				printRight(31, 3 + i, (unsigned char*)(text + e->pointsOff),
+				           FONT_LIGHT_BLUE, false);
+			}
+		}
+		drawCursor((u8)(3 + cursor));
+		/*
+		    One line rather than two, because the row it used to take is a row of the list -- and on
+		    a 24-row screen with forty-five achievements to show, a row is worth more than a second
+		    hint. Left and right page through, which is the only way a set this size is walkable.
+		*/
+		raDiagnostics(v);
+		print(1, 23, (unsigned char*)"A: OK / B: Back", FONT_WHITE, false);
+
+		waitKeys(KEY_A | KEY_B | KEY_UP | KEY_DOWN | KEY_LEFT | KEY_RIGHT);
+		if (KEYS & KEY_B) {
+			return;
+		}
+		if (KEYS & KEY_UP) {
+			if (cursor > 0) {
+				cursor--;
+			} else if (top > 0) {
+				top--;
+			}
+			continue;
+		}
+		if (KEYS & KEY_DOWN) {
+			if (cursor < rows - 1 && top + cursor + 1 < v->count) {
+				cursor++;
+			} else if (top + rows < v->count) {
+				top++;
+			}
+			continue;
+		}
+		/*
+		    A page at a time. Clamped rather than wrapped, and the cursor is pulled back to the last
+		    real row on the final page -- a caret sitting on a blank line below the set would be the
+		    page inviting a press that does nothing.
+		*/
+		if (KEYS & KEY_LEFT) {
+			top = (top > rows) ? top - rows : 0;
+			continue;
+		}
+		if (KEYS & KEY_RIGHT) {
+			if (top + rows < v->count) {
+				top += rows;
+				if (top + cursor >= v->count) {
+					cursor = v->count - top - 1;
+				}
+			}
+			continue;
+		}
+
+		/* A: the description of the line under the cursor, on a page of its own. */
+		{
+			const raViewerEntry* const e = &v->entry[top + cursor];
+
+			clearScreen(false);
+			if (e->titleOff) {
+				print(1, 0, (unsigned char*)(text + e->titleOff), FONT_WHITE, false);
+			}
+			if (e->pointsOff) {
+				print(1, 2, (unsigned char*)(text + e->pointsOff), FONT_LIGHT_BLUE, false);
+				print(6, 2, (unsigned char*)"points", FONT_LIGHT_GRAY, false);
+			}
+			/*
+			    The same three states as the list, in the same place, so moving between the two
+			    pages does not move the fact. `(sync pending)` rather than a second word for earned:
+			    it is the *sending* that is outstanding, and saying so is what stops a player
+			    wondering whether the achievement itself is in doubt.
+			*/
+			if (e->flags & RA_VIEWER_EARNED) {
+				printRight(31, 2, (unsigned char*)"earned", FONT_LIME, false);
+			} else if (e->flags & RA_VIEWER_QUEUED) {
+				printRight(31, 2, (unsigned char*)"(sync pending)", FONT_RED, false);
+			}
+			/*
+			    When it was earned, under the description rather than beside the status: the status
+			    is one word and this is a sentence, and a line of its own is the only place a date
+			    and a time both fit on a 32-column screen.
+
+			    Printed only when there is one, and there are three ways for there not to be. The
+			    account does not hold it, which the status line above has already said. It was earned
+			    during *this* session, where the flag flips while the game runs and nothing in that
+			    context has a date -- only hours and minutes on sharedAddr. Or the block filled and
+			    the date was the first field dropped, which is what raPatchWriteEarned() trims first.
+
+			    Nothing is printed for any of them, deliberately: an empty row says less than a wrong
+			    one, and "unknown" beside an achievement a player is looking at would invite the
+			    question of what else is unknown about it.
+			*/
+			if (e->when) {
+				print(1, 10, (unsigned char*)"Earned", FONT_LIGHT_GRAY, false);
+				raPrintNum(8, 10, 4, RA_WHEN_YEAR(e->when), FONT_WHITE);
+				print(12, 10, (unsigned char*)"-", FONT_DARKER_GRAY, false);
+				printDec(13, 10, RA_WHEN_MONTH(e->when), 2, FONT_WHITE, false);
+				print(15, 10, (unsigned char*)"-", FONT_DARKER_GRAY, false);
+				printDec(16, 10, RA_WHEN_DAY(e->when), 2, FONT_WHITE, false);
+				printDec(20, 10, RA_WHEN_HOUR(e->when), 2, FONT_WHITE, false);
+				print(22, 10, (unsigned char*)":", FONT_DARKER_GRAY, false);
+				printDec(23, 10, RA_WHEN_MINUTE(e->when), 2, FONT_WHITE, false);
+			}
+			if (e->descOff) {
+				/*
+				    Wrapped by hand at 30 columns, because print() does not wrap and a description
+				    is up to 64 characters. 30 rather than 32: the text starts at column 1, since
+				    column 0 belongs to drawCursor() everywhere on this page, and the last column is
+				    left clear so a full line does not touch the bezel. Broken at a space where
+				    there is one within reach, so a word is not cut in half.
+				*/
+				const char* d = text + e->descOff;
+				int         line;
+
+				for (line = 0; line < 4 && *d; line++) {
+					unsigned char row[31];
+					int           n = 0;
+					int           cut;
+
+					while (n < 30 && d[n]) {
+						n++;
+					}
+					cut = n;
+					if (d[n]) {
+						while (cut > 0 && d[cut] != ' ') {
+							cut--;
+						}
+						if (cut == 0) {
+							cut = n;   /* one long word: cut it rather than loop forever */
+						}
+					}
+					for (n = 0; n < cut; n++) {
+						row[n] = (unsigned char)d[n];
+					}
+					row[cut] = 0;
+					print(1, 5 + line, row, FONT_LIGHT_GRAY, false);
+					d += cut;
+					while (*d == ' ') {
+						d++;
+					}
+				}
+			}
+			print(1, 23, igmText.bNo, FONT_WHITE, false);
+			waitKeys(KEY_B);
+		}
+	}
+}
+
+/*
+    Which mode this session is in, and when it is not the one the player asked for, why.
+
+    A line in the folder rather than a page of its own: it is one fact, and a page for one fact is a
+    button press charged for nothing. It sits above the folder's own name so the two read as one
+    footer -- what this is, and what it is doing right now.
+
+    **The reason is the half that earns it.** "Softcore" alone answers a question nobody was asking;
+    a player who set `hardcore=1` and is looking at this screen wants to know what took it away, and
+    without this the only answer available is to power off, take the card out and read
+    `ra_wifi_launcher.log` on a PC.
+
+    The `hardcore` case says what changed rather than only what it is called, because the visible
+    consequence of hardcore in this menu is two pages away in the RAM viewer, and a player who finds
+    that refusal first should not have to guess which setting caused it.
+*/
+static void raSessionLine(int row) {
+	const raSessionBlock* const s = (const raSessionBlock*)CARDENGINEI_ARM9_RA_SESSION_LOCATION;
+
+	if (s->magic != RA_SESSION_MAGIC) {
+		/*
+		    Same distinction the pending page draws, and for the same reason: no launcher told this
+		    boot anything, which is a different state from being told softcore.
+		*/
+		print(1, row, (unsigned char*)"No session this boot", FONT_DARKER_GRAY, false);
+	} else if (s->hardcore) {
+		print(1, row, (unsigned char*)"Hardcore -- RAM editing locked", FONT_LIME, false);
+	} else if (s->refusal == RA_REFUSED_CHEATS) {
+		/*
+		    Red, although enabling cheats is a deliberate act and not an error. What is not
+		    deliberate is the consequence, and a player who turned on one cheat months ago is
+		    exactly the one who has not connected it to the mode this session is running in.
+		*/
+		print(1, row, (unsigned char*)"Softcore -- cheats are on", FONT_RED, false);
+	} else {
+		print(1, row, (unsigned char*)"Softcore", FONT_LIGHT_GRAY, false);
+	}
+}
+
+/*
+    The folder. Two entries today, and it is a folder rather than a page so that forcing a sync or
+    reading the launcher's log have somewhere to go that is not the root menu.
+*/
+/* Saved by the existing menu unload into pagefile.sys, so FTP can inspect
+ * popup evidence without introducing writes during gameplay. */
+static volatile raPopupDiagnostic raPopupLast;
+
+static bool raPopupPage(void) {
+	raViewerBlock* const v = (raViewerBlock*)CARDENGINEI_ARM9_RA_VIEWER_LOCATION;
+	raPopupDiagnostic* const d = &v->popup;
+	clearScreen(false);
+	print(1, 0, (unsigned char*)"Popup diagnostics", FONT_WHITE, false);
+	if (v->magic != RA_VIEWER_MAGIC || d->magic != RA_POPUP_DIAG_MAGIC) {
+		print(1, 3, (unsigned char*)"No runtime data yet", FONT_LIGHT_GRAY, false);
+		print(1, 23, igmText.bNo, FONT_WHITE, false);
+		waitKeys(KEY_B);
+		return false;
+	}
+	raPopupLast = *d;
+	print(1, 2, (unsigned char*)(d->allowed ? "Popup enabled for this game" : "Popup disabled by settings"), FONT_LIGHT_GRAY, false);
+    const raSessionBlock* session=(const raSessionBlock*)CARDENGINEI_ARM9_RA_SESSION_LOCATION;
+    if(session->magic==RA_SESSION_MAGIC && session->bridgeMagic==RA_BRIDGE_EXTENSION && session->renderer==RA_RENDERER_ARM11) {
+        print(1,4,(unsigned char*)(d->bridgeStatus==2?"ARM11 link unavailable":d->bridgeStatus==1?"ARM11 link connected":"ARM11 link pending"),FONT_LIGHT_GRAY,false);
+        print(1,6,(unsigned char*)"Queued / delivered / lost",FONT_LIGHT_GRAY,false);
+        raPrintNum(1,7,8,d->bridgeQueued,FONT_LIME);
+        raPrintNum(11,7,8,d->bridgeSent,FONT_LIME);
+        raPrintNum(21,7,8,d->bridgeDropped,FONT_RED);
+        print(1,9,(unsigned char*)"Link timeouts",FONT_LIGHT_GRAY,false);
+        raPrintNum(18,9,5,d->bridgeTimeouts,FONT_LIGHT_BLUE);
+        if(d->arm11Magic==RA_BRIDGE_STATS_MAGIC) {
+            print(1,10,(unsigned char*)"Output busy / GPU busy",FONT_LIGHT_GRAY,false);
+            raPrintNum(1,11,8,d->arm11.no_free_buffer,FONT_LIGHT_BLUE);
+            raPrintNum(17,11,8,d->arm11.gpu_busy,FONT_LIGHT_BLUE);
+        }
+        print(1,12,(unsigned char*)(d->titleSource==1?"Game name: RetroAchievements":d->titleSource==2?"Game name: cached RA title":"Game name: ROM header"),FONT_LIGHT_GRAY,false);
+        print(1,14,(unsigned char*)(d->coveragePartial?"Evaluation coverage: partial":"Evaluation coverage: loaded"),FONT_LIGHT_GRAY,false);
+        print(1,16,(unsigned char*)"Preview status",FONT_LIGHT_GRAY,false);
+        raPrintNum(17,16,1,d->preview,FONT_LIGHT_BLUE);
+        print(1,18,(unsigned char*)"Test awards no achievement.",FONT_LIGHT_GRAY,false);
+        if(d->arm11Magic==RA_BRIDGE_STATS_MAGIC) {
+            print(1,19,(unsigned char*)"Frames / rejects / alloc err",FONT_LIGHT_GRAY,false);
+            raPrintNum(1,20,8,d->arm11.composited,FONT_LIME);
+            raPrintNum(12,20,7,d->arm11.active_rejected,FONT_RED);
+            raPrintNum(24,20,5,d->arm11.allocation_errors,FONT_RED);
+            print(1,21,(unsigned char*)"Fmt:         Stride:",FONT_LIGHT_GRAY,false);
+            printHex(6,21,d->arm11.format,4,FONT_LIGHT_BLUE,false);
+            raPrintNum(23,21,5,d->arm11.stride,FONT_LIGHT_BLUE);
+            print(1,22,(unsigned char*)"Cache err:    Comp us:",FONT_LIGHT_GRAY,false);
+            raPrintNum(11,22,3,d->arm11.cache_errors,FONT_RED);
+            raPrintNum(23,22,6,d->arm11.composite_max_ticks/268,FONT_LIGHT_BLUE);
+        } else print(1,20,(unsigned char*)"ARM11 frame data pending",FONT_LIGHT_GRAY,false);
+    } else {
+	print(1, 4, (unsigned char*)"Shown / denied / evicted", FONT_LIGHT_GRAY, false);
+	raPrintNum(1, 5, 8, d->shows, FONT_LIME);
+	raPrintNum(11, 5, 8, d->denied, FONT_RED);
+	raPrintNum(21, 5, 8, d->evicted, FONT_RED);
+	print(1, 7, (unsigned char*)"State / display / windows", FONT_LIGHT_GRAY, false);
+	printHex(1, 8, d->state, 1, FONT_LIGHT_BLUE, false);
+	printHex(6, 8, d->dispcnt, 4, FONT_LIGHT_BLUE, false);
+	printHex(16, 8, d->window, 4, FONT_LIGHT_BLUE, false);
+	print(1, 10, (unsigned char*)"Live display / brightness", FONT_LIGHT_GRAY, false);
+	printHex(1, 11, d->liveDispcnt, 4, FONT_LIGHT_BLUE, false);
+	printHex(12, 11, d->liveBright, 2, FONT_LIGHT_BLUE, false);
+	print(1, 13, (unsigned char*)"Live VRAM A B C D E F G H I", FONT_LIGHT_GRAY, false);
+	for (int b = 0; b < 9; ++b) printHex(1 + 3*b, 14, d->liveVramCnt[b], 1, FONT_LIGHT_BLUE, false);
+	print(1, 16, (unsigned char*)"Preview status", FONT_LIGHT_GRAY, false);
+	raPrintNum(17, 16, 1, d->preview, FONT_LIGHT_BLUE);
+	print(1, 18, (unsigned char*)"Test awards no achievement.", FONT_LIGHT_GRAY, false);
+	print(1, 19, (unsigned char*)"Line:    -    Late:", FONT_LIGHT_GRAY, false);
+	raPrintNum(6, 19, 3, d->writeLineMin, FONT_LIGHT_BLUE);
+	raPrintNum(11, 19, 3, d->writeLineMax, FONT_LIGHT_BLUE);
+	raPrintNum(20, 19, 3, d->lateSamples, FONT_LIGHT_BLUE);
+	print(1, 20, (unsigned char*)"Row:    Cover:       was:", FONT_LIGHT_GRAY, false);
+	raPrintNum(5, 20, 2, d->row, FONT_LIGHT_BLUE);
+	raPrintNum(15, 20, 5, d->covered, FONT_LIGHT_BLUE);
+	raPrintNum(26, 20, 5, d->originalCovered, FONT_LIGHT_BLUE);
+	/*
+	    Both answer what the counters above cannot. Zero ink over 64 words blits successfully and
+	    shows nothing at all, which no counter distinguishes from a blit that never landed; and a
+	    held count of one against shows is a slot reclaimed immediately rather than a draw missed.
+	*/
+	print(1, 21, (unsigned char*)"Ink of 512   held frames", FONT_LIGHT_GRAY, false);
+	raPrintNum(12, 21, 3, d->stripWords, FONT_LIME);
+	raPrintNum(25, 21, 4, d->heldFrames, FONT_LIME);
+	print(1, 22, (unsigned char*)"LCD:     Flip:     OAM:", FONT_LIGHT_GRAY, false);
+	printHex(5, 22, d->powerControl, 2, FONT_LIGHT_BLUE, false);
+	raPrintNum(15, 22, 3, d->panelFlips, FONT_LIGHT_BLUE);
+	raPrintNum(24, 22, 3, d->objClobbered, FONT_LIGHT_BLUE);
+    }
+	print(1, 23, (unsigned char*)(d->allowed ? "A: Test popup / B: Back" : "B: Back"), FONT_WHITE, false);
+	const u16 pressed = raWaitKeys(d->allowed ? KEY_A | KEY_B : KEY_B);
+	if (!(pressed & KEY_A) || (pressed & KEY_B)) return false;
+	d->preview = RA_POPUP_PREVIEW_REQUEST;
+	raPopupLast.preview = RA_POPUP_PREVIEW_REQUEST;
+	/* Same acknowledged EXIT path as B; actual preview runs only after resume. */
+	sharedAddr[4] = 0x54495845;
+	while (sharedAddr[4] != 0) swiDelay(100);
+	return true;
+}
+
+static void raMenu(void) {
+	int cursor = 0;
+	const raViewerBlock* const v = (const raViewerBlock*)CARDENGINEI_ARM9_RA_VIEWER_LOCATION;
+	if (v->magic == RA_VIEWER_MAGIC && v->popup.magic == RA_POPUP_DIAG_MAGIC)
+		raPopupLast = v->popup;
+
+	while (1) {
+		clearScreen(false);
+		print(2, 0, igmText.raMenu[RA_MENU_SYNC_PENDING], FONT_WHITE, false);
+		print(2, 1, igmText.raMenu[RA_MENU_ACHIEVEMENTS], FONT_WHITE, false);
+		print(2, 2, (unsigned char*)"Popup diagnostics / test", FONT_WHITE, false);
+		raSessionLine(0x18 - 5);
+		/*
+		    The folder names itself down here, where the main menu names the program, rather than as
+		    a header above its own items -- which read as the same page twice on the way to them.
+		*/
+		print(1, 0x18 - 3, (unsigned char*)"RetroAchievements", FONT_LIGHT_GRAY, false);
+		print(0, 23, igmText.bNo, FONT_WHITE, false);
+		drawCursor((u8)cursor);
+
+		const u16 pressed = raWaitKeys(KEY_A | KEY_B | KEY_UP | KEY_DOWN);
+		if (pressed & KEY_B)
+			return;
+		if (pressed & KEY_UP) {
+			if (cursor > 0)
+				cursor--;
+			continue;
+		}
+		if (pressed & KEY_DOWN) {
+			if (cursor < 2)
+				cursor++;
+			continue;
+		}
+		if (cursor == RA_MENU_SYNC_PENDING)
+			raPendingPage();
+		else if (cursor == RA_MENU_ACHIEVEMENTS)
+			raAchievementsPage();
+		else if (raPopupPage())
+			return;
+	}
+}
+
 static void optionsMenu(s32 *mainScreen, u32 consoleModel) {
 	OptionsItem optionsItems[8];
 	int optionsItemCount = 0;
@@ -698,21 +1377,87 @@ static void jumpToAddress(void) {
 			if(cursorPosition > 0)
 				cursorPosition--;
 		} else if(KEYS & (KEY_A | KEY_B)) {
+			clampAddress();
 			return;
 		}
 	}
 }
 
+/*
+    Is this boot a hardcore RetroAchievements session.
+
+    The launcher settles that before it touches the radio and stages the answer where the bootloader
+    copies it, exactly as it stages the pending tally -- see CARDENGINEI_ARM9_RA_SESSION_LOCATION.
+    Read here rather than inferred from anything else in the window: a set of definitions being
+    present says achievements are being evaluated, which is true in softcore too.
+
+    **No magic means no.** That is the safe default and not merely the convenient one. The word is
+    zeroed by the bootloader on every boot that stages no session block, so a plain nds-bootstrap
+    build, a build with the launcher's network compiled out, and a console where the RA window never
+    loads all read false -- and none of those can submit a hardcore unlock. The failure this
+    ordering avoids is the other one: a stale word from a previous boot deciding that a hardcore
+    session may edit its own memory.
+*/
+static bool raHardcoreSession(void) {
+	const raSessionBlock* const s = (const raSessionBlock*)CARDENGINEI_ARM9_RA_SESSION_LOCATION;
+
+	return s->magic == RA_SESSION_MAGIC && s->hardcore != 0;
+}
+
+/*
+    Why A did nothing, said where the player is looking when they press it.
+
+    Drawn over the last two rows of the dump and left until a key is pressed; the loop redraws every
+    row from memory each pass, so nothing has to clean this up. Two lines because one of them has to
+    be the way out -- a refusal that does not say what to change is a bug report.
+
+    A is waited out before the message is dismissible, and that is not fussiness. waitKeys() gives up
+    suppressing a held key after ten frames and then returns on the next one it sees, so a press held
+    for more than about a sixth of a second would dismiss the very message it opened -- the player
+    would see a red flash and nothing they could read. Releasing first makes the dismissal a fresh
+    press whatever they did with the first one.
+*/
+static void ramEditRefused(void) {
+	print(0, 22, (unsigned char*)"Hardcore: RAM editing is locked", FONT_RED, false);
+	print(0, 23, (unsigned char*)"Set hardcore=0 in ra.cfg to edit", FONT_LIGHT_GRAY, false);
+
+	do {
+		while (REG_VCOUNT != 191) mySwiDelay(100);
+		while (REG_VCOUNT == 191) mySwiDelay(100);
+	} while (KEYS & KEY_A);
+
+	waitKeys(KEY_A | KEY_B);
+}
+
 static void ramViewer(void) {
+	bool hardcore;
+
 	clearScreen(false);
 	(*changeMpu)();
+
+	/*
+	    Read once, and after changeMpu() rather than before it.
+
+	    After, because the block lives in DSi WRAM and this function is compiled into builds that
+	    have no such thing -- the RAM viewer is offered on every console, the RA window is not. Under
+	    the widened regions the read is the same read the viewer itself is about to make of anywhere
+	    the player types, so it cannot fault where the viewer would not.
+
+	    Once, because nothing can change the answer while the menu is open -- the launcher wrote it
+	    at boot and the game has been stopped since -- and one read means the check below and the
+	    write it guards cannot disagree.
+	*/
+	hardcore = raHardcoreSession();
 
 	u8 *arm7RamBuffer = ((u8*)sharedAddr) - 0x74C;
 	tonccpy(arm7RamBak, arm7RamBuffer, 0xC0);
 	bool ramLoaded = false;
 	u8 cursorPosition = 0, mode = 0;
 	while(1) {
-		u8 *ramPtr = arm7Ram ? arm7RamBuffer : (u8*)address;
+		u8 *ramPtr;
+
+		clampAddress();
+		ramPtr = arm7Ram ? arm7RamBuffer : (u8*)address;
 
 		unsigned char armText[5] = {'A', 'R', 'M', arm7Ram ? '7' : '9', 0};
 		printCenter(14, 0, igmText.ramViewer, FONT_WHITE, false);
@@ -813,7 +1558,20 @@ static void ramViewer(void) {
 				if(cursorPosition < 8 * 23 - 1)
 					cursorPosition++;
 			} else if (KEYS & KEY_A) {
-				mode = 2;
+				/*
+				    The one door into edit mode, and where a hardcore session is turned away.
+
+				    Here rather than at the viewer's entrance on purpose: reading memory is not
+				    what RetroAchievements' rules are about, and a hex dump of a running game is a
+				    debugging tool this fork has no reason to take away from anybody. What is
+				    forbidden is changing it, so that is what is refused -- navigation, the ARM7
+				    window and the cursor all still work.
+				*/
+				if (hardcore) {
+					ramEditRefused();
+				} else {
+					mode = 2;
+				}
 			} else if (KEYS & KEY_B) {
 				mode = 0;
 			} else if(KEYS & KEY_Y) {
@@ -821,6 +1579,20 @@ static void ramViewer(void) {
 				clearScreen(false);
 			}
 		} else if(mode == 2) {
+			/*
+			    Gated twice, and the second gate is not decoration.
+
+			    Everything below this line writes: the four directions edit the byte under the
+			    cursor in place -- on the ARM9 `ramPtr` *is* the game's memory, not a copy of it --
+			    and A or B pushes the edited window back across to the ARM7 with RAMW. Today the
+			    branch above is the only way into this mode, so this cannot fire. A later change
+			    that adds a second way in would reopen all of it at once, and the symptom would not
+			    be a crash somebody notices: it would be an unlock claimed as hardcore.
+			*/
+			if (hardcore) {
+				mode = 1;
+				continue;
+			}
 			if (KEYS & KEY_UP) {
 				ramPtr[cursorPosition]++;
 			} else if (KEYS & KEY_DOWN) {
@@ -918,7 +1690,7 @@ u32 inGameMenu(s32 *mainScreen, u32 consoleModel, s32 *exceptionRegisters) {
 	// Let ARM7 know the menu loaded
 	sharedAddr[5] = 0x59444552; // 'REDY'
 
-	MenuItem menuItems[8];
+	MenuItem menuItems[9];
 	int menuItemCount = 0;
 	if(!exception)
 		menuItems[menuItemCount++] = MENU_EXIT;
@@ -930,6 +1702,13 @@ u32 inGameMenu(s32 *mainScreen, u32 consoleModel, s32 *exceptionRegisters) {
 	if(!exception)
 		menuItems[menuItemCount++] = MENU_OPTIONS;
 	menuItems[menuItemCount++] = MENU_RAM_VIEWER;
+	/*
+	    Not offered on an exception screen, like every other entry that reads staged memory: the
+	    block lives in cardenginei_arm9_ra's window and a crashed game is the one case where nothing
+	    about that window can be trusted.
+	*/
+	if (!exception)
+		menuItems[menuItemCount++] = MENU_RETROACHIEVEMENTS;
 	menuItems[menuItemCount++] = MENU_QUIT;
 
 	if(exception) {
@@ -1019,8 +1798,22 @@ u32 inGameMenu(s32 *mainScreen, u32 consoleModel, s32 *exceptionRegisters) {
 				case MENU_RAM_VIEWER:
 					ramViewer();
 					break;
+				case MENU_RETROACHIEVEMENTS:
+					raMenu();
+					break;
 				case MENU_QUIT:
-					if (boolQuestion(igmText.quitGameMessage)) {
+					if (consoleModel >= 2) {
+						/* The NTR reboot path hung on the tested 3DS. Resume through
+						 * the normal B path (including pending drain), then let HOME
+						 * close TWL software. Do not claim the reboot cause is fixed. */
+						clearScreen(false);
+						print(1, 2, (unsigned char*)"Close game on 3DS", FONT_WHITE, false);
+						print(1, 5, (unsigned char*)"Press B to return to the game.", FONT_LIGHT_GRAY, false);
+						print(1, 7, (unsigned char*)"Then press HOME and close it.", FONT_LIGHT_GRAY, false);
+						waitKeys(KEY_B);
+						sharedAddr[4] = 0x54495845; // acknowledged EXIT, like B
+						while (sharedAddr[4] != 0) swiDelay(100);
+					} else if (boolQuestion(igmText.quitGameMessage)) {
 						res = 0x54495845; // EXIT
 						sharedAddr[3] = res;
 						sharedAddr[4] = 0x54495551; // QUIT

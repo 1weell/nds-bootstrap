@@ -36,6 +36,7 @@
 #include "nds_header.h"
 #include "cardengine.h"
 #include "locations.h"
+#include "ra_reader.h"
 #include "cardengine_header_arm9.h"
 #include "unpatched_funcs.h"
 
@@ -58,6 +59,7 @@
 #define tFormersFix BIT(18)
 #define useColorLut BIT(21)
 #define colorLutBlockVCount BIT(22)
+#define raWramLoaded BIT(23)
 
 //#ifdef DLDI
 #include "my_fat.h"
@@ -401,6 +403,9 @@ extern void enableIPC_SYNC(void);
 
 #ifndef TWLSDK
 extern void initialize(void);
+#if RA_READER_ENABLED
+extern void raRearmVBlank(void);   /* misc.c -- installs the per-frame hook, and puts it back if the game removed it */
+#endif
 #endif
 
 //static void clearIcache (void) {
@@ -794,6 +799,14 @@ void cardRead(u32* cacheStruct, u8* dst0, u32 src0, u32 len0) {
 	}
 	#else
 	initialize();
+	/*
+	    Cheap, and here because here is what survives: see raRearmVBlank(). Two register compares on a
+	    path that already does a card read, against a per-frame hook that a game can silently remove.
+	    It is also where the hook is first installed -- installing and re-arming are the same act.
+	*/
+	#if RA_READER_ENABLED
+	raRearmVBlank();
+	#endif
 
 	if (!(ce9->valueBits & isSdk5)) {
 		debugRamMpuFix();
@@ -1605,7 +1618,16 @@ void myIrqHandlerVcount(void) {
 	nocashMessage("myIrqHandlerVcount");
 	#endif
 
-	applyColorLut(false);
+	// The colour LUT's again, and only its: the RA reader moved to a VBlank hook of its
+	// own after Contra 4 showed a game can leave this one firing on 8% of frames.
+	//
+	// The guard is now redundant -- hookIPC_SYNC() only installs this handler for a LUT
+	// game -- and it is kept anyway. It costs one compare on a path that is about to do
+	// a full colour pass, and dropping it would be an unrelated behaviour change riding
+	// along with this one.
+	if (ce9->valueBits & useColorLut) {
+		applyColorLut(false);
+	}
 
 	/* #ifndef TWLSDK
 	if (sharedAddr[4] == 0x554E454D) {
@@ -1613,6 +1635,16 @@ void myIrqHandlerVcount(void) {
 	}
 	#endif */
 }
+
+#if RA_READER_ENABLED
+//---------------------------------------------------------------------------------
+void myIrqHandlerRaVblank(void) {
+//---------------------------------------------------------------------------------
+	// Chained onto the game's own VBlank handler by raRearmVBlank(), and it runs after the
+	// game's -- so the game's frame work completes before any of ours starts.
+	ra_tick(ce9->consoleModel, (ce9->valueBits & raWramLoaded) != 0);
+}
+#endif
 
 //---------------------------------------------------------------------------------
 void myIrqHandlerIPC(void) {
@@ -1764,6 +1796,8 @@ u32 myIrqEnable(u32 irq) {
 	irq |= IRQ_IPC_SYNC;
 	REG_IPC_SYNC |= IPC_SYNC_IRQ_ENABLE;
 
+	// Matches the condition in hookIPC_SYNC(). The RA reader used to be in here too and
+	// is not any more: it hooks VBlank, which the game enables for itself.
 	if ((ce9->valueBits & useColorLut) && !(ce9->valueBits & colorLutBlockVCount)) {
 		irq_before = IRQ_VCOUNT;
 		irq |= IRQ_VCOUNT;

@@ -15,6 +15,8 @@
 
 #include "igm_text.h"
 #include "locations.h"
+#include "ra_gfx_patch.h"
+#include "ra_wifi.h"
 
 extern u8 gameOnFlashcard;
 extern u16 a9ScfgRom;
@@ -3293,6 +3295,29 @@ u32 patchCardNdsArm9(cardengineArm9* ce9, const tNDSHeader* ndsHeader, const mod
 	if (colorLutEnabled) {
 		patchMobiclipFrameDraw(ndsHeader, moduleParams);
 	}
+
+    /* ATRE only, with the loaded, versioned RA image and explicit popup opt-in.
+     * Patch the original ARM9/autoload image, never guessed live ITCM scratch. */
+    {
+        extern bool raWramLoaded;
+        extern u32 iUncompressedSize;
+        const raSessionBlock* session = (const raSessionBlock*)CARDENGINEI_ARM9_RA_SESSION_LOCATION;
+        const vu32* image = (const vu32*)CARDENGINEI_ARM9_RA_LOCATION;
+        if (ce9->consoleModel > 0 && raWramLoaded && memcmp(romTid, "ATRE", 4) == 0
+         && session->magic == RA_SESSION_MAGIC && session->overlay
+         && !(session->bridgeMagic == RA_BRIDGE_EXTENSION && session->renderer == RA_RENDERER_ARM11)
+         && image[RA_GFX_MAGIC_OFFSET/4] == RA_GFX_ABI_MAGIC
+         && (image[RA_GFX_DMA_ENTRY/4] & 0xFF000000u) == 0xEA000000u
+         && (image[RA_GFX_BANK_ENTRY/4] & 0xFF000000u) == 0xEA000000u
+         && (u32)ndsHeader->arm9destination >= 0x02000000
+         && (u32)ndsHeader->arm9destination < 0x02400000
+         && iUncompressedSize <= 0x02400000-(u32)ndsHeader->arm9destination) {
+            int patched = raGfxPatchImage((u32*)ndsHeader->arm9destination, iUncompressedSize,
+                CARDENGINEI_ARM9_RA_LOCATION+RA_GFX_DMA_ENTRY,
+                CARDENGINEI_ARM9_RA_LOCATION+RA_GFX_BANK_ENTRY);
+            dbg_printf(patched ? "RA graphics hooks installed\n" : "RA graphics signature mismatch; unchanged\n");
+        }
+    }
 
 	dbg_printf("ERR_NONE\n\n");
 	return ERR_NONE;

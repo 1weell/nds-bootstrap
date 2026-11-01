@@ -1622,6 +1622,25 @@ u32 fileWrite (const char* buffer, aFile* file, u32 startOffset, u32 length)
 	#endif
 	curByte = startOffset % BYTES_PER_SECTOR;
 
+	/*
+	    **And the same for the write, which is the half that corrupted a file.**
+
+	    A write that does not start on a sector boundary is a read-modify-write: the sector is read,
+	    the caller's bytes are pasted over part of it, and all 512 go back out. Merging into a stale
+	    buffer therefore does not just return wrong data -- it *writes* it. ra_unlocks.txt came back
+	    with a correct 48-byte record and 464 bytes of the running game's memory around it, exactly
+	    one sector wide.
+
+	    Fixed here rather than at the call site, and the placement is the decision: the first attempt
+	    exported a helper for the ARM7 cardengine to call, and that binary failed to link -- .bss past
+	    the end of its region, on the tightest binary in the tree. Here it costs that binary nothing
+	    and covers every caller, because every partial write anywhere had the same exposure.
+	*/
+	#ifdef TWOCARD
+	prevSect[fileCard2] = -1;
+	#else
+	prevSect = -1;
+	#endif
 	loadSectorBuf(file, curSect);
 
 	// Number of bytes needed to read to align with a sector

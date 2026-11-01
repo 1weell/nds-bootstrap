@@ -42,6 +42,7 @@ redistribute it freely, subject to the following restrictions:
 
 #include "hex.h"
 #include "fifocheck.h"
+#include "ra_wifi.h"
 
 //static vu32* wordCommandAddr;
 
@@ -175,12 +176,25 @@ int main(void) {
 
 	fifoSetValue32Handler(FIFO_USER_01, myFIFOValue32Handler, NULL);
 
+#if RA_LAUNCHER_WIFI
+	// Step two of the RA network ladder. Deliberately after the FIFO handshake above, so
+	// that handshake is unchanged -- see retail/arm7/source/ra_wifi7.c. Off in every
+	// shipped build; a build with it on does not boot games.
+	raWifiInstall();
+#endif
+
 	// Keep the ARM7 mostly idle
 	while (1) {
 		if (*(u32*)(0x2FFFD0C) == 0x454D4D43) {
 			my_sdmmc_get_cid(true, (u32*)0x2FFD7BC);	// Get eMMC CID
 			*(u32*)(0x2FFFD0C) = 0;
 		}
+#if RA_LAUNCHER_WIFI
+		// Mode 2 asks for the radio back before booting the game. Done here rather than in the
+		// FIFO handler that asks: wifi_card_deinit() polls SDIO registers, and that is not a wait
+		// to take inside an interrupt. A compare per wake-up when nobody has asked.
+		raWifiPoll();
+#endif
 		swiIntrWait(0, IRQ_FIFO_NOT_EMPTY);
 	}
 	
